@@ -5,7 +5,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/hashicorp/vault-client-go"
+	"github.com/hashicorp/vault/api"
 	"golang.org/x/term"
 )
 
@@ -19,7 +19,7 @@ type VaultClientConfig struct {
 	TlsSkipVerify bool
 }
 
-func BuildClients() (*vault.Client, *vault.Client, error) {
+func BuildClients() (*api.Client, *api.Client, error) {
 
 	var c VaultClientConfig
 
@@ -63,21 +63,20 @@ func BuildClients() (*vault.Client, *vault.Client, error) {
 	return srcClient, dstClient, nil
 }
 
-func getClient(address string, token string, namespace string, skipVerify bool) (*vault.Client, error) {
-	tls := vault.TLSConfiguration{}
-	tls.InsecureSkipVerify = skipVerify
-
-	client, err := vault.New(
-		vault.WithAddress(address),
-		vault.WithRequestTimeout(10*time.Second),
-		vault.WithRetryConfiguration(vault.RetryConfiguration{}),
-		vault.WithTLS(tls),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("error initializing client for %s: %w", address, err)
+func getClient(address string, token string, namespace string, skipVerify bool) (*api.Client, error) {
+	clientConfig := &api.Config{
+		Address: address,
 	}
-	client.SetToken(token)
+
+	clientConfig.ConfigureTLS(&api.TLSConfig{Insecure: skipVerify})
+	client, err := api.NewClient(clientConfig)
+	if err != nil {
+		log.Fatal(err)
+	}
 	client.SetNamespace(namespace)
+	client.SetReadYourWrites(true)
+	client.SetClientTimeout(3 * time.Second)
+	client.SetToken(token)
 
 	return client, nil
 }
