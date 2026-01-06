@@ -39,8 +39,8 @@ func Copy(srcClient, dstClient *api.Client) error {
 
 type KVV2Cluster struct {
 	Client    *api.Client
-	MountPath string // e.g. "kv" (no leading/trailing slash)
-	BasePath  string // e.g. "apps/team-a" or "" for root of mount
+	MountPath string
+	BasePath  string
 }
 
 type Migrator struct {

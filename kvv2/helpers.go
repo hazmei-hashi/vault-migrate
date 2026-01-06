@@ -57,9 +57,6 @@ func (m *Migrator) kv2List(ctx context.Context, c KVV2Cluster, relPrefix string)
 	mount := trimSlashes(c.MountPath)
 	logical := c.Client.Logical()
 
-	// Root listing can be finicky across setups; try both forms.
-	// 1) "<mount>/metadata" (no trailing slash)
-	// 2) "<mount>/metadata/" (with trailing slash)
 	var path string
 	if relPrefix == "" {
 		path = mount + "/metadata"
