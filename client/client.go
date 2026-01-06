@@ -73,10 +73,29 @@ func getClient(address string, token string, namespace string, skipVerify bool) 
 	if err != nil {
 		log.Fatal(err)
 	}
-	client.SetNamespace(namespace)
 	client.SetReadYourWrites(true)
 	client.SetClientTimeout(3 * time.Second)
 	client.SetToken(token)
+
+	health, err := client.Sys().Health()
+	if err != nil {
+		log.Fatalf("Health check failed for %s: %v\n", address, err)
+	} else if !health.Initialized {
+		log.Fatalf("%s is not initialized, aborting.\n", address)
+	} else if health.Sealed {
+		log.Fatalf("%s is sealed, aborting.\n", address)
+	} else {
+		lookup, err := client.Auth().Token().LookupSelf()
+		if err != nil {
+			log.Fatalf("\nToken lookup failed for %s\n", address)
+		} else {
+			ttl, _ := lookup.TokenTTL()
+			log.Printf("Found initialized/unsealed cluster %s (Token TTL: %b)\n", health.ClusterID, ttl)
+		}
+	}
+
+	// wait to set namespace until health checks completed
+	client.SetNamespace(namespace)
 
 	return client, nil
 }

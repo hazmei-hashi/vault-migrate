@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sort"
 	"strconv"
 	"strings"
@@ -11,7 +12,7 @@ import (
 
 // walkAllKeys returns leaf secret keys relative to the mount
 func (m *Migrator) walkAllKeys(ctx context.Context, c KVV2Cluster, startPrefix string) ([]string, error) {
-	fmt.Printf("Scanning base path: %s\n", startPrefix)
+	log.Printf("Scanning base path: %s\n", startPrefix)
 	startPrefix = trimSlashes(startPrefix)
 
 	var out []string
@@ -50,7 +51,7 @@ func (m *Migrator) walkAllKeys(ctx context.Context, c KVV2Cluster, startPrefix s
 
 // kv2List lists keys under <mount>/metadata/<relPrefix>.
 func (m *Migrator) kv2List(ctx context.Context, c KVV2Cluster, relPrefix string) ([]string, error) {
-	fmt.Printf("Listing contents at path: %s\n", relPrefix)
+	log.Printf("Listing contents at path: %s\n", relPrefix)
 	relPrefix = trimSlashes(relPrefix)
 
 	mount := trimSlashes(c.MountPath)
@@ -190,7 +191,7 @@ func (m *Migrator) copyOneSecret(ctx context.Context, srcKey, dstKey string, opt
 }
 
 func (m *Migrator) kv2ReadMetadata(ctx context.Context, c KVV2Cluster, relKey string) (*kv2MetadataResp, error) {
-	fmt.Printf("Scanning secret: %s -> ", relKey)
+	log.Printf("Scanning secret: %s -> ", relKey)
 	relKey = trimSlashes(relKey)
 	path := trimSlashes(c.MountPath) + "/metadata/" + relKey
 
@@ -212,7 +213,7 @@ func (m *Migrator) kv2ReadMetadata(ctx context.Context, c KVV2Cluster, relKey st
 }
 
 func (m *Migrator) kv2ReadVersion(ctx context.Context, c KVV2Cluster, relKey string, version int) (map[string]any, error) {
-	fmt.Printf("Reading secret: %s (version %b) -> ", relKey, version)
+	log.Printf("Reading secret: %s (version %b) -> ", relKey, version)
 	relKey = trimSlashes(relKey)
 	path := trimSlashes(c.MountPath) + "/data/" + relKey
 
@@ -235,7 +236,7 @@ func (m *Migrator) kv2ReadVersion(ctx context.Context, c KVV2Cluster, relKey str
 }
 
 func (m *Migrator) kv2WriteData(ctx context.Context, c KVV2Cluster, relKey string, data map[string]any) error {
-	fmt.Printf("Writing secret to destination: %s -> ", relKey)
+	log.Printf("Writing secret to destination: %s -> ", relKey)
 	relKey = trimSlashes(relKey)
 	path := trimSlashes(c.MountPath) + "/data/" + relKey
 
@@ -272,7 +273,7 @@ func (m *Migrator) kv2DestroyVersions(ctx context.Context, c KVV2Cluster, relKey
 }
 
 func (m *Migrator) kv2WriteMetadataSettings(ctx context.Context, c KVV2Cluster, relKey string, meta *kv2MetadataResp) error {
-	fmt.Printf("Setting metadata: %s\n", relKey)
+	log.Printf("Setting metadata: %s\n", relKey)
 	relKey = trimSlashes(relKey)
 	path := trimSlashes(c.MountPath) + "/metadata/" + relKey
 
