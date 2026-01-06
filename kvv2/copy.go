@@ -3,7 +3,6 @@ package kvv2
 import (
 	"context"
 	"fmt"
-	"runtime"
 
 	"github.com/hashicorp/vault/api"
 )
@@ -63,7 +62,6 @@ func (m *Migrator) Run(ctx context.Context, opts Options) error {
 		}
 	}
 
-	// Collect keys first (simple). If you prefer streaming, you can call fn inline in walk.
 	keys, err := m.walkAllKeys(ctx, m.Src, trimSlashes(m.Src.BasePath))
 	if err != nil {
 		return err
@@ -79,9 +77,6 @@ func (m *Migrator) Run(ctx context.Context, opts Options) error {
 			}
 			return fmt.Errorf("copy %q -> %q: %w", srcKey, dstKey, err)
 		}
-
-		// Encourage GC between secrets to keep memory bounded.
-		runtime.GC()
 	}
 
 	return nil
