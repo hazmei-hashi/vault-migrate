@@ -3,11 +3,29 @@ package kvv2
 import (
 	"context"
 	"fmt"
+	"vault-migrate/config"
 
 	"github.com/hashicorp/vault/api"
 )
 
-func Copy(srcClient, dstClient *api.Client) error {
+type KVV2Cluster struct {
+	Client    *api.Client
+	MountPath string
+	BasePath  string
+}
+
+type Migrator struct {
+	Src      KVV2Cluster
+	Dst      KVV2Cluster
+	LogLevel string
+}
+
+type Options struct {
+	ContinueOnError bool
+	Placeholder     map[string]any
+}
+
+func Init(srcClient, dstClient *api.Client, logLevel string) error {
 	var srcCluster KVV2Cluster
 	var dstCluster KVV2Cluster
 
@@ -30,27 +48,15 @@ func Copy(srcClient, dstClient *api.Client) error {
 	var m Migrator
 	m.Src = srcCluster
 	m.Dst = dstCluster
+	m.LogLevel = logLevel
+
+	logger := config.SetupLogger(logLevel)
+	logger.Debug("Initializing KV-V2 copy")
 	err := m.Run(context.Background(), Options{})
 	if err != nil {
-		fmt.Printf("%v", err)
+		logger.Error("migration failed", "err", err)
 	}
 	return nil
-}
-
-type KVV2Cluster struct {
-	Client    *api.Client
-	MountPath string
-	BasePath  string
-}
-
-type Migrator struct {
-	Src KVV2Cluster
-	Dst KVV2Cluster
-}
-
-type Options struct {
-	ContinueOnError bool
-	Placeholder     map[string]any
 }
 
 // Initializes the KVV2 migrator
