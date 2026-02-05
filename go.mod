@@ -3,7 +3,6 @@ module vault-migrate
 go 1.25.5
 
 require (
-	github.com/hashicorp/vault-client-go v0.4.3
 	github.com/hashicorp/vault/api v1.22.0
 	golang.org/x/term v0.38.0
 )
