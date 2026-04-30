@@ -1,9 +1,12 @@
 package kvv2
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
+	"strings"
 	"vault-migrate/config"
 	"vault-migrate/state"
 
@@ -29,25 +32,52 @@ type Migrator struct {
 type Options struct {
 	ContinueOnError bool
 	Placeholder     map[string]any
+	DryRun          bool
 }
 
 func Init(srcClient, dstClient *api.Client, cfg config.VaultClientConfig) error {
+	scanner := bufio.NewScanner(os.Stdin)
+
 	var srcCluster KVV2Cluster
 	var dstCluster KVV2Cluster
 
-	fmt.Print("Source KV-V2 mount: ")
-	fmt.Scan(&srcCluster.MountPath)
+	fmt.Print("Source KV-V2 mount (e.g., 'secret'): ")
+	if scanner.Scan() {
+		srcCluster.MountPath = strings.TrimSpace(scanner.Text())
+	}
+	srcCluster.MountPath = trimSlashes(srcCluster.MountPath)
+	fmt.Printf("  Normalized mount: %s\n", srcCluster.MountPath)
 
-	fmt.Print("Source KV-V2 base path: ")
-	fmt.Scan(&srcCluster.BasePath)
+	fmt.Print("Source KV-V2 base path (e.g., 'myapp/' or leave empty for root): ")
+	if scanner.Scan() {
+		srcCluster.BasePath = strings.TrimSpace(scanner.Text())
+	}
+	srcCluster.BasePath = trimSlashes(srcCluster.BasePath)
+	if srcCluster.BasePath != "" {
+		fmt.Printf("  Normalized path: %s\n", srcCluster.BasePath)
+	} else {
+		fmt.Printf("  Using root path\n")
+	}
 
 	srcCluster.Client = srcClient
 
-	fmt.Print("Destination KV-V2 mount: ")
-	fmt.Scan(&dstCluster.MountPath)
+	fmt.Print("Destination KV-V2 mount (e.g., 'secret'): ")
+	if scanner.Scan() {
+		dstCluster.MountPath = strings.TrimSpace(scanner.Text())
+	}
+	dstCluster.MountPath = trimSlashes(dstCluster.MountPath)
+	fmt.Printf("  Normalized mount: %s\n", dstCluster.MountPath)
 
-	fmt.Print("Destination KV-V2 base path: ")
-	fmt.Scan(&dstCluster.BasePath)
+	fmt.Print("Destination KV-V2 base path (e.g., 'myapp-migrated/' or leave empty for root): ")
+	if scanner.Scan() {
+		dstCluster.BasePath = strings.TrimSpace(scanner.Text())
+	}
+	dstCluster.BasePath = trimSlashes(dstCluster.BasePath)
+	if dstCluster.BasePath != "" {
+		fmt.Printf("  Normalized path: %s\n", dstCluster.BasePath)
+	} else {
+		fmt.Printf("  Using root path\n")
+	}
 
 	dstCluster.Client = dstClient
 
@@ -107,8 +137,14 @@ func Init(srcClient, dstClient *api.Client, cfg config.VaultClientConfig) error 
 	}
 
 	logger.Debug("Initializing KV-V2 copy")
+
+	if cfg.DryRun {
+		logger.Info("DRY RUN MODE - No changes will be made to destination")
+	}
+
 	err := m.Run(context.Background(), Options{
 		ContinueOnError: cfg.ContinueOnError,
+		DryRun:          cfg.DryRun,
 	})
 	if err != nil {
 		logger.Error("migration failed", "err", err)
@@ -131,7 +167,17 @@ func (m *Migrator) Run(ctx context.Context, opts Options) error {
 		return err
 	}
 
-	m.Logger.Info("Starting migration", "total_secrets", len(keys))
+	m.Logger.Info("Starting migration", "total_secrets", len(keys), "dry_run", opts.DryRun)
+
+	if opts.DryRun {
+		m.Logger.Info("DRY RUN: Would migrate the following secrets:")
+		for i, srcKey := range keys {
+			dstKey := m.dstKeyFor(srcKey)
+			m.Logger.Info("Would copy", "index", i+1, "src", srcKey, "dst", dstKey)
+		}
+		m.Logger.Info("DRY RUN complete", "total_secrets", len(keys))
+		return nil
+	}
 
 	completed := 0
 	failed := 0

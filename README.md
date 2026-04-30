@@ -125,6 +125,8 @@ The tool will prompt for mount paths and base paths, then:
         Maximum retry attempts for failed secrets (default 3)
   -continueOnError
         Continue migration even if individual secrets fail
+  -dryRun
+        Preview migration without making changes
 ```
 
 ### Running with Flags
@@ -143,6 +145,9 @@ The tool will prompt for mount paths and base paths, then:
 
 **Advanced options:**
 ```bash
+# Preview migration without making changes
+./vault-migrate -dryRun ...
+
 # Custom state file location
 ./vault-migrate -stateFile /path/to/migration-state.json ...
 

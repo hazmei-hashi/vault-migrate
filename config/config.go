@@ -21,6 +21,7 @@ type VaultClientConfig struct {
 	ForceRecopy     bool
 	MaxRetries      int
 	ContinueOnError bool
+	DryRun          bool
 }
 
 type SetFlags map[string]bool

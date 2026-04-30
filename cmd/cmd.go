@@ -13,10 +13,10 @@ import (
 func Init() {
 	var c config.VaultClientConfig
 
-	flag.StringVar(&c.SrcAddr, "srcAddr", "https://localhost:8200", "Source cluster API address")
+	flag.StringVar(&c.SrcAddr, "srcAddr", "", "Source cluster API address")
 	flag.StringVar(&c.SrcToken, "srcToken", "", "Source cluster token")
 	flag.StringVar(&c.SrcNamespace, "srcNamespace", "", "Source cluster namespace")
-	flag.StringVar(&c.DstAddr, "dstAddr", "https://localhost:8300", "Destination cluster API address")
+	flag.StringVar(&c.DstAddr, "dstAddr", "", "Destination cluster API address")
 	flag.StringVar(&c.DstToken, "dstToken", "", "Destination cluster token")
 	flag.StringVar(&c.DstNamespace, "dstNamespace", "", "Destination cluster namespace")
 	flag.BoolVar(&c.TlsSkipVerify, "tlsSkipVerify", false, "Skip TLS verification of the Vault server certificates")
@@ -27,6 +27,7 @@ func Init() {
 	flag.BoolVar(&c.ForceRecopy, "forceRecopy", false, "Re-copy secrets even if hashes match")
 	flag.IntVar(&c.MaxRetries, "maxRetries", 3, "Maximum retry attempts for failed secrets")
 	flag.BoolVar(&c.ContinueOnError, "continueOnError", false, "Continue migration even if individual secrets fail")
+	flag.BoolVar(&c.DryRun, "dryRun", false, "Preview migration without making changes")
 	flag.Parse()
 
 	setFlags := make(config.SetFlags)
