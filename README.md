@@ -81,7 +81,7 @@ Both source and destination tokens require policies that allow:
 The tool will prompt for mount paths and base paths, then:
 - Create `.vault-migrate-state.json` to track progress
 - Copy all secrets incrementally
-- Show progress every 10 secrets
+- Show real-time progress bar (INFO level) or detailed logs (DEBUG level)
 - Skip already-migrated secrets on re-run
 
 **Resume a failed migration:**
@@ -98,13 +98,13 @@ The tool will prompt for mount paths and base paths, then:
 
 ```bash
   -srcAddr string
-        Source cluster API address (default "https://localhost:8200")
+        Source cluster API address
   -srcToken string
         Source cluster token
   -srcNamespace string
         Source cluster namespace
   -dstAddr string
-        Destination cluster API address (default "https://localhost:8300")
+        Destination cluster API address
   -dstToken string
         Destination cluster token
   -dstNamespace string
@@ -195,6 +195,29 @@ Destination KV-V2 base path: myapp-migrated/
 
 **Note:** Tokens are read securely with hidden input. Mount and base paths are **relative to the mount** and should not include `data/`, `metadata/`, or the mount name.
 
+### Progress Display
+
+The tool provides different levels of progress feedback based on the log level:
+
+**INFO Level (default):**
+- Clean, in-place progress bar in terminal environments
+- Shows: `Progress: [████████░░] 50% (125/250) - 120 completed, 3 failed, 2 skipped`
+- Updates throttled to 100ms intervals for performance
+- Fallback to periodic line logging in CI/CD environments (non-TTY)
+
+**DEBUG Level:**
+- Detailed per-secret operation logs
+- Shows: `FULL COPY`, `INCREMENTAL COPY`, `SKIP (already migrated)`, `RECREATE (hash mismatch)`
+- Additional metadata and API operation details
+
+**Example output (INFO level):**
+```
+Starting migration total_secrets=250 dry_run=false
+Progress: [████████████████████░░░░░░░░░░░░░░░░░░░░] 50% (125/250) - 120 completed, 3 failed, 2 skipped
+Migration completed total=250 completed=242 failed=5 skipped=3
+State saved file=.vault-migrate-state.json
+```
+
 ## Behavior and Re-run Considerations
 
 ### State Tracking (NEW)
@@ -274,13 +297,24 @@ When state tracking is enabled (default):
 - If hashes mismatch: Destroys destination and performs full copy from source
 
 **3. Same version count**
-- Compares all version hashes
-- If all match: Skips (already migrated)
-- If any differ: Destroys destination and performs full copy from source
+- **With state hashes (fast path)**: Compares version hashes from state file
+  - If all match: Skips (already migrated)
+  - If any differ: Destroys destination and performs full copy from source
+- **Without state hashes (slow path)**: Reads and compares actual secret data
+  - Computes SHA256 hashes of source and destination versions
+  - If all match: Skips (destination already has correct data)
+  - If any differ: Destroys destination and performs full copy from source
+  - **Note**: This ensures correct behavior even when migrating to pre-existing secrets
 
 **4. Destination ahead of source**
 - Logs error (manual review needed)
 - Skips the secret
+
+**Smart Skip Behavior:**
+The tool intelligently detects when destination secrets already match the source, even without a state file. This prevents unnecessary re-copying when:
+- Running migration multiple times without state tracking
+- Migrating to a destination that was previously populated
+- Recovering from a partial migration
 
 #### Disabling State Tracking
 

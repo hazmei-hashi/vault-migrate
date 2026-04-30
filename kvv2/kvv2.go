@@ -219,42 +219,51 @@ func (m *Migrator) copyOneSecretWithState(ctx context.Context, srcKey, dstKey st
 	if destExists {
 		dstMaxVersion := getMaxVersion(dstMeta)
 
-		if srcMaxVersion == dstMaxVersion && existingState != nil && existingState.Status == "completed" {
-			allMatch, err := m.verifyVersionHashes(ctx, srcKey, dstKey, srcMeta, existingState)
-			if err != nil {
-				m.Logger.Warn("Failed to verify hashes", "secret", srcKey, "err", err)
-			} else if allMatch && !m.Config.ForceRecopy {
-				m.Logger.Info("SKIP (already migrated)", "secret", srcKey, "versions", srcMaxVersion)
-				secretState := &state.Secret{
-					Status:             "skipped",
-					SourceVersionCount: srcMaxVersion,
-					DestVersionCount:   dstMaxVersion,
-					VersionHashes:      existingState.VersionHashes,
-					VersionStates:      existingState.VersionStates,
-					MetadataChecksum:   existingState.MetadataChecksum,
-				}
-				m.State.UpdateSecret(srcKey, secretState)
-				if err := m.State.Save(m.StateFile); err != nil {
-					m.Logger.Error("failed to save state", "err", err)
-				}
-				return nil
-			}
-		}
-
-		if srcMaxVersion > dstMaxVersion {
-			m.Logger.Info("INCREMENTAL COPY", "secret", srcKey, "existing_versions", dstMaxVersion, "new_versions", srcMaxVersion-dstMaxVersion)
-			return m.copyIncrementalVersions(ctx, srcKey, dstKey, srcMeta, dstMaxVersion+1, srcMaxVersion, opts)
-		}
-
+		// Case 1: Same version count - verify if already migrated
 		if srcMaxVersion == dstMaxVersion {
-			hashMismatch := false
-			if existingState != nil && existingState.Status == "completed" {
-				match, _ := m.verifyVersionHashes(ctx, srcKey, dstKey, srcMeta, existingState)
-				hashMismatch = !match
-			}
+			// If we have completed state with hashes, use those
+			if existingState != nil && existingState.Status == "completed" && len(existingState.VersionHashes) > 0 {
+				allMatch, err := m.verifyVersionHashes(ctx, srcKey, dstKey, srcMeta, existingState)
+				if err != nil {
+					m.Logger.Warn("Failed to verify hashes", "secret", srcKey, "err", err)
+				} else if allMatch && !m.Config.ForceRecopy {
+					m.Logger.Debug("SKIP (already migrated)", "secret", srcKey, "versions", srcMaxVersion)
+					secretState := &state.Secret{
+						Status:             "skipped",
+						SourceVersionCount: srcMaxVersion,
+						DestVersionCount:   dstMaxVersion,
+						VersionHashes:      existingState.VersionHashes,
+						VersionStates:      existingState.VersionStates,
+						MetadataChecksum:   existingState.MetadataChecksum,
+					}
+					m.State.UpdateSecret(srcKey, secretState)
+					if err := m.State.Save(m.StateFile); err != nil {
+						m.Logger.Error("failed to save state", "err", err)
+					}
+					return nil
+				}
+			} else {
+				// No state or no hashes - need to verify by reading actual data
+				m.Logger.Debug("Verifying destination secret (no state)", "secret", srcKey)
+				allMatch, err := m.verifyDestinationMatches(ctx, srcKey, dstKey, srcMeta)
+				if err != nil {
+					m.Logger.Warn("Failed to verify destination", "secret", srcKey, "err", err)
+					// On verification error, recreate to be safe
+					m.Logger.Debug("RECREATE (verification failed)", "secret", srcKey)
+					if err := m.kv2DeleteSecret(ctx, m.Dst, dstKey); err != nil {
+						return fmt.Errorf("delete destination secret: %w", err)
+					}
+					return m.copySecretFull(ctx, srcKey, dstKey, srcMeta, opts)
+				}
 
-			if hashMismatch {
-				m.Logger.Info("RECREATE (hash mismatch)", "secret", srcKey)
+				if allMatch && !m.Config.ForceRecopy {
+					m.Logger.Debug("SKIP (destination matches)", "secret", srcKey, "versions", srcMaxVersion)
+					// Don't update state here - let it be marked completed on next run
+					return nil
+				}
+
+				// Hashes don't match - recreate
+				m.Logger.Debug("RECREATE (hash mismatch)", "secret", srcKey)
 				if err := m.kv2DeleteSecret(ctx, m.Dst, dstKey); err != nil {
 					return fmt.Errorf("delete destination secret: %w", err)
 				}
@@ -262,6 +271,13 @@ func (m *Migrator) copyOneSecretWithState(ctx context.Context, srcKey, dstKey st
 			}
 		}
 
+		// Case 2: Source has more versions - incremental copy
+		if srcMaxVersion > dstMaxVersion {
+			m.Logger.Debug("INCREMENTAL COPY", "secret", srcKey, "existing_versions", dstMaxVersion, "new_versions", srcMaxVersion-dstMaxVersion)
+			return m.copyIncrementalVersions(ctx, srcKey, dstKey, srcMeta, dstMaxVersion+1, srcMaxVersion, opts)
+		}
+
+		// Case 3: Destination has more versions than source - error
 		if srcMaxVersion < dstMaxVersion {
 			m.Logger.Warn("SKIP (destination ahead of source)", "secret", srcKey, "src_versions", srcMaxVersion, "dst_versions", dstMaxVersion)
 			secretState := &state.Secret{
@@ -278,7 +294,7 @@ func (m *Migrator) copyOneSecretWithState(ctx context.Context, srcKey, dstKey st
 		}
 	}
 
-	m.Logger.Info("FULL COPY", "secret", srcKey, "versions", srcMaxVersion)
+	m.Logger.Debug("FULL COPY", "secret", srcKey, "versions", srcMaxVersion)
 	return m.copySecretFull(ctx, srcKey, dstKey, srcMeta, opts)
 }
 
@@ -530,6 +546,43 @@ func (m *Migrator) verifyVersionHashes(ctx context.Context, srcKey, dstKey strin
 		}
 
 		if actualHash != expectedHash {
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
+func (m *Migrator) verifyDestinationMatches(ctx context.Context, srcKey, dstKey string, srcMeta *kv2MetadataResp) (bool, error) {
+	maxV := getMaxVersion(srcMeta)
+
+	for v := 1; v <= maxV; v++ {
+		vm, ok := srcMeta.Data.Versions[strconv.Itoa(v)]
+		if !ok || vm.Destroyed {
+			continue
+		}
+
+		srcPayload, err := m.kv2ReadVersion(ctx, m.Src, srcKey, v)
+		if err != nil {
+			return false, fmt.Errorf("read source version %d: %w", v, err)
+		}
+
+		dstPayload, err := m.kv2ReadVersion(ctx, m.Dst, dstKey, v)
+		if err != nil {
+			return false, fmt.Errorf("read destination version %d: %w", v, err)
+		}
+
+		srcHash, err := state.HashPayload(srcPayload)
+		if err != nil {
+			return false, fmt.Errorf("hash source version %d: %w", v, err)
+		}
+
+		dstHash, err := state.HashPayload(dstPayload)
+		if err != nil {
+			return false, fmt.Errorf("hash destination version %d: %w", v, err)
+		}
+
+		if srcHash != dstHash {
 			return false, nil
 		}
 	}

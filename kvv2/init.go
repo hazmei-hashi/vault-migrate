@@ -92,6 +92,7 @@ func Init(srcClient, dstClient *api.Client, cfg config.VaultClientConfig) error 
 	m.Logger = logger
 
 	if !cfg.NoState {
+		logger.Debug("Loading state file", "path", cfg.StateFile)
 		existingState, err := state.Load(cfg.StateFile)
 		if err != nil {
 			return fmt.Errorf("load state file: %w", err)
@@ -183,6 +184,17 @@ func (m *Migrator) Run(ctx context.Context, opts Options) error {
 	failed := 0
 	skipped := 0
 
+	var progressBar *ProgressBar
+	showProgressBar := m.Logger.Enabled(ctx, slog.LevelInfo) &&
+		!m.Logger.Enabled(ctx, slog.LevelDebug) &&
+		len(keys) > 0
+	if showProgressBar {
+		progressBar = NewProgressBar(len(keys))
+		if progressBar.IsTTY() {
+			fmt.Print(progressBar.Render())
+		}
+	}
+
 	for i, srcKey := range keys {
 		dstKey := m.dstKeyFor(srcKey)
 
@@ -213,9 +225,30 @@ func (m *Migrator) Run(ctx context.Context, opts Options) error {
 			completed++
 		}
 
-		if (i+1)%10 == 0 || i+1 == len(keys) {
-			m.Logger.Info("Progress", "completed", completed, "failed", failed, "skipped", skipped, "total", len(keys))
+		if progressBar != nil {
+			progressBar.Update(completed, failed, skipped)
+			if progressBar.IsTTY() {
+				if progressBar.ShouldRender() {
+					fmt.Print(progressBar.Render())
+				}
+			} else {
+				// Non-TTY fallback: periodic line logging
+				if (i+1)%10 == 0 || i+1 == len(keys) {
+					m.Logger.Info("Progress", "completed", completed, "failed", failed, "skipped", skipped, "total", len(keys))
+				}
+			}
+		} else {
+			if (i+1)%10 == 0 {
+				m.Logger.Debug("Progress", "completed", completed, "failed", failed, "skipped", skipped, "total", len(keys))
+			}
 		}
+	}
+
+	if progressBar != nil {
+		if progressBar.IsTTY() {
+			fmt.Print(progressBar.RenderFinal())
+		}
+		progressBar.Finish()
 	}
 
 	m.Logger.Info("Migration completed", "total", len(keys), "completed", completed, "failed", failed, "skipped", skipped)
