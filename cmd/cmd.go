@@ -2,7 +2,9 @@ package cmd
 
 import (
 	"flag"
+	"fmt"
 	"log"
+	"strings"
 	"vault-migrate/client"
 	"vault-migrate/config"
 	"vault-migrate/kvv2"
@@ -24,6 +26,7 @@ func Init() {
 	flag.BoolVar(&c.NoState, "noState", false, "Disable state tracking (legacy mode)")
 	flag.BoolVar(&c.ForceRecopy, "forceRecopy", false, "Re-copy secrets even if hashes match")
 	flag.IntVar(&c.MaxRetries, "maxRetries", 3, "Maximum retry attempts for failed secrets")
+	flag.BoolVar(&c.ContinueOnError, "continueOnError", false, "Continue migration even if individual secrets fail")
 	flag.Parse()
 
 	setFlags := make(config.SetFlags)
@@ -33,6 +36,10 @@ func Init() {
 
 	logger := config.SetupLogger(c.LogLevel)
 	logger.Debug("debug logging enabled")
+
+	if err := validateConfig(c); err != nil {
+		log.Fatalf("Configuration validation failed: %v", err)
+	}
 
 	srcClient, dstClient, err := client.BuildClients(c, setFlags)
 	if err != nil {
@@ -49,4 +56,42 @@ func Init() {
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
+}
+
+func validateConfig(c config.VaultClientConfig) error {
+	if strings.TrimSpace(c.SrcAddr) == "" {
+		return fmt.Errorf("source address (srcAddr) cannot be empty")
+	}
+
+	if strings.TrimSpace(c.DstAddr) == "" {
+		return fmt.Errorf("destination address (dstAddr) cannot be empty")
+	}
+
+	if !strings.HasPrefix(c.SrcAddr, "http://") && !strings.HasPrefix(c.SrcAddr, "https://") {
+		return fmt.Errorf("source address must start with http:// or https://")
+	}
+
+	if !strings.HasPrefix(c.DstAddr, "http://") && !strings.HasPrefix(c.DstAddr, "https://") {
+		return fmt.Errorf("destination address must start with http:// or https://")
+	}
+
+	validLogLevels := map[string]bool{
+		"debug": true,
+		"info":  true,
+		"warn":  true,
+		"error": true,
+	}
+	if !validLogLevels[strings.ToLower(c.LogLevel)] {
+		return fmt.Errorf("invalid log level: %s (must be debug, info, warn, or error)", c.LogLevel)
+	}
+
+	if c.MaxRetries < 0 {
+		return fmt.Errorf("maxRetries must be >= 0")
+	}
+
+	if c.StateFile == "" && !c.NoState {
+		return fmt.Errorf("stateFile cannot be empty when state tracking is enabled")
+	}
+
+	return nil
 }

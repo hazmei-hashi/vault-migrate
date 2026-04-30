@@ -3,6 +3,7 @@ package kvv2
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"vault-migrate/config"
 	"vault-migrate/state"
 
@@ -22,6 +23,7 @@ type Migrator struct {
 	Config    config.VaultClientConfig
 	State     *state.MigrationState
 	StateFile string
+	Logger    *slog.Logger
 }
 
 type Options struct {
@@ -49,14 +51,15 @@ func Init(srcClient, dstClient *api.Client, cfg config.VaultClientConfig) error 
 
 	dstCluster.Client = dstClient
 
+	logger := config.SetupLogger(cfg.LogLevel)
+
 	var m Migrator
 	m.Src = srcCluster
 	m.Dst = dstCluster
 	m.LogLevel = cfg.LogLevel
 	m.Config = cfg
 	m.StateFile = cfg.StateFile
-
-	logger := config.SetupLogger(cfg.LogLevel)
+	m.Logger = logger
 
 	if !cfg.NoState {
 		existingState, err := state.Load(cfg.StateFile)
@@ -104,7 +107,9 @@ func Init(srcClient, dstClient *api.Client, cfg config.VaultClientConfig) error 
 	}
 
 	logger.Debug("Initializing KV-V2 copy")
-	err := m.Run(context.Background(), Options{})
+	err := m.Run(context.Background(), Options{
+		ContinueOnError: cfg.ContinueOnError,
+	})
 	if err != nil {
 		logger.Error("migration failed", "err", err)
 		return err
@@ -114,8 +119,6 @@ func Init(srcClient, dstClient *api.Client, cfg config.VaultClientConfig) error 
 
 // Initializes the KVV2 migrator
 func (m *Migrator) Run(ctx context.Context, opts Options) error {
-	logger := config.SetupLogger(m.LogLevel)
-
 	if opts.Placeholder == nil {
 		opts.Placeholder = map[string]any{
 			"_vault_migrate": "placeholder",
@@ -128,7 +131,7 @@ func (m *Migrator) Run(ctx context.Context, opts Options) error {
 		return err
 	}
 
-	logger.Info("Starting migration", "total_secrets", len(keys))
+	m.Logger.Info("Starting migration", "total_secrets", len(keys))
 
 	completed := 0
 	failed := 0
@@ -147,7 +150,7 @@ func (m *Migrator) Run(ctx context.Context, opts Options) error {
 		if copyErr != nil {
 			failed++
 			if opts.ContinueOnError {
-				logger.Warn("Copy failed", "progress", fmt.Sprintf("%d/%d", i+1, len(keys)), "src", srcKey, "dst", dstKey, "err", copyErr)
+				m.Logger.Warn("Copy failed", "progress", fmt.Sprintf("%d/%d", i+1, len(keys)), "src", srcKey, "dst", dstKey, "err", copyErr)
 				continue
 			}
 			return fmt.Errorf("copy %q -> %q: %w", srcKey, dstKey, copyErr)
@@ -165,17 +168,17 @@ func (m *Migrator) Run(ctx context.Context, opts Options) error {
 		}
 
 		if (i+1)%10 == 0 || i+1 == len(keys) {
-			logger.Info("Progress", "completed", completed, "failed", failed, "skipped", skipped, "total", len(keys))
+			m.Logger.Info("Progress", "completed", completed, "failed", failed, "skipped", skipped, "total", len(keys))
 		}
 	}
 
-	logger.Info("Migration completed", "total", len(keys), "completed", completed, "failed", failed, "skipped", skipped)
+	m.Logger.Info("Migration completed", "total", len(keys), "completed", completed, "failed", failed, "skipped", skipped)
 
 	if m.State != nil && !m.Config.NoState {
 		if err := m.State.Save(m.StateFile); err != nil {
-			logger.Error("failed to save final state", "err", err)
+			m.Logger.Error("failed to save final state", "err", err)
 		} else {
-			logger.Info("State saved", "file", m.StateFile)
+			m.Logger.Info("State saved", "file", m.StateFile)
 		}
 	}
 

@@ -123,6 +123,8 @@ The tool will prompt for mount paths and base paths, then:
         Re-copy secrets even if hashes match
   -maxRetries int
         Maximum retry attempts for failed secrets (default 3)
+  -continueOnError
+        Continue migration even if individual secrets fail
 ```
 
 ### Running with Flags
@@ -146,6 +148,9 @@ The tool will prompt for mount paths and base paths, then:
 
 # Force re-copy even if secrets haven't changed
 ./vault-migrate -forceRecopy ...
+
+# Continue on errors (don't stop if individual secrets fail)
+./vault-migrate -continueOnError ...
 
 # Disable state tracking (legacy behavior)
 ./vault-migrate -noState ...

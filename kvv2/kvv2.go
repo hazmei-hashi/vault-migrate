@@ -7,14 +7,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"vault-migrate/config"
 	"vault-migrate/state"
 )
 
 // walkAllKeys returns leaf secret keys relative to the mount
 func (m *Migrator) walkAllKeys(ctx context.Context, c KVV2Cluster, startPrefix string) ([]string, error) {
-	logger := config.SetupLogger(m.LogLevel)
-	logger.Info("STARTING COPY", "base-path", startPrefix)
+	m.Logger.Info("STARTING COPY", "base-path", startPrefix)
 	startPrefix = trimSlashes(startPrefix)
 
 	var out []string
@@ -53,8 +51,7 @@ func (m *Migrator) walkAllKeys(ctx context.Context, c KVV2Cluster, startPrefix s
 
 // kv2List lists keys under <mount>/metadata/<relPrefix>.
 func (m *Migrator) kv2List(ctx context.Context, c KVV2Cluster, relPrefix string) ([]string, error) {
-	logger := config.SetupLogger(m.LogLevel)
-	logger.Debug("LIST", "relative-path", relPrefix)
+	m.Logger.Debug("LIST", "relative-path", relPrefix)
 	relPrefix = trimSlashes(relPrefix)
 
 	mount := trimSlashes(c.MountPath)
@@ -191,8 +188,6 @@ func (m *Migrator) copyOneSecret(ctx context.Context, srcKey, dstKey string, opt
 }
 
 func (m *Migrator) copyOneSecretWithState(ctx context.Context, srcKey, dstKey string, opts Options) error {
-	logger := config.SetupLogger(m.LogLevel)
-
 	if m.State == nil {
 		return m.copyOneSecret(ctx, srcKey, dstKey, opts)
 	}
@@ -211,7 +206,7 @@ func (m *Migrator) copyOneSecretWithState(ctx context.Context, srcKey, dstKey st
 		}
 		m.State.UpdateSecret(srcKey, secretState)
 		if err := m.State.Save(m.StateFile); err != nil {
-			logger.Error("failed to save state", "err", err)
+			m.Logger.Error("failed to save state", "err", err)
 		}
 		return fmt.Errorf("read source metadata: %w", err)
 	}
@@ -227,9 +222,9 @@ func (m *Migrator) copyOneSecretWithState(ctx context.Context, srcKey, dstKey st
 		if srcMaxVersion == dstMaxVersion && existingState != nil && existingState.Status == "completed" {
 			allMatch, err := m.verifyVersionHashes(ctx, srcKey, dstKey, srcMeta, existingState)
 			if err != nil {
-				logger.Warn("Failed to verify hashes", "secret", srcKey, "err", err)
+				m.Logger.Warn("Failed to verify hashes", "secret", srcKey, "err", err)
 			} else if allMatch && !m.Config.ForceRecopy {
-				logger.Info("SKIP (already migrated)", "secret", srcKey, "versions", srcMaxVersion)
+				m.Logger.Info("SKIP (already migrated)", "secret", srcKey, "versions", srcMaxVersion)
 				secretState := &state.Secret{
 					Status:             "skipped",
 					SourceVersionCount: srcMaxVersion,
@@ -240,14 +235,14 @@ func (m *Migrator) copyOneSecretWithState(ctx context.Context, srcKey, dstKey st
 				}
 				m.State.UpdateSecret(srcKey, secretState)
 				if err := m.State.Save(m.StateFile); err != nil {
-					logger.Error("failed to save state", "err", err)
+					m.Logger.Error("failed to save state", "err", err)
 				}
 				return nil
 			}
 		}
 
 		if srcMaxVersion > dstMaxVersion {
-			logger.Info("INCREMENTAL COPY", "secret", srcKey, "existing_versions", dstMaxVersion, "new_versions", srcMaxVersion-dstMaxVersion)
+			m.Logger.Info("INCREMENTAL COPY", "secret", srcKey, "existing_versions", dstMaxVersion, "new_versions", srcMaxVersion-dstMaxVersion)
 			return m.copyIncrementalVersions(ctx, srcKey, dstKey, srcMeta, dstMaxVersion+1, srcMaxVersion, opts)
 		}
 
@@ -259,7 +254,7 @@ func (m *Migrator) copyOneSecretWithState(ctx context.Context, srcKey, dstKey st
 			}
 
 			if hashMismatch {
-				logger.Info("RECREATE (hash mismatch)", "secret", srcKey)
+				m.Logger.Info("RECREATE (hash mismatch)", "secret", srcKey)
 				if err := m.kv2DeleteSecret(ctx, m.Dst, dstKey); err != nil {
 					return fmt.Errorf("delete destination secret: %w", err)
 				}
@@ -268,7 +263,7 @@ func (m *Migrator) copyOneSecretWithState(ctx context.Context, srcKey, dstKey st
 		}
 
 		if srcMaxVersion < dstMaxVersion {
-			logger.Warn("SKIP (destination ahead of source)", "secret", srcKey, "src_versions", srcMaxVersion, "dst_versions", dstMaxVersion)
+			m.Logger.Warn("SKIP (destination ahead of source)", "secret", srcKey, "src_versions", srcMaxVersion, "dst_versions", dstMaxVersion)
 			secretState := &state.Secret{
 				Status:             "failed",
 				Error:              "destination has more versions than source - manual review needed",
@@ -277,18 +272,17 @@ func (m *Migrator) copyOneSecretWithState(ctx context.Context, srcKey, dstKey st
 			}
 			m.State.UpdateSecret(srcKey, secretState)
 			if err := m.State.Save(m.StateFile); err != nil {
-				logger.Error("failed to save state", "err", err)
+				m.Logger.Error("failed to save state", "err", err)
 			}
 			return fmt.Errorf("destination has more versions than source")
 		}
 	}
 
-	logger.Info("FULL COPY", "secret", srcKey, "versions", srcMaxVersion)
+	m.Logger.Info("FULL COPY", "secret", srcKey, "versions", srcMaxVersion)
 	return m.copySecretFull(ctx, srcKey, dstKey, srcMeta, opts)
 }
 
 func (m *Migrator) copySecretFull(ctx context.Context, srcKey, dstKey string, srcMeta *kv2MetadataResp, opts Options) error {
-	logger := config.SetupLogger(m.LogLevel)
 
 	maxV := getMaxVersion(srcMeta)
 	versionHashes := make(map[string]string)
@@ -329,7 +323,7 @@ func (m *Migrator) copySecretFull(ctx context.Context, srcKey, dstKey string, sr
 
 				hash, err := state.HashPayload(payload)
 				if err != nil {
-					logger.Warn("Failed to hash payload", "version", v, "err", err)
+					m.Logger.Warn("Failed to hash payload", "version", v, "err", err)
 				} else {
 					versionHashes[strconv.Itoa(v)] = hash
 				}
@@ -365,7 +359,7 @@ func (m *Migrator) copySecretFull(ctx context.Context, srcKey, dstKey string, sr
 		srcMeta.Data.CustomMetadata,
 	)
 	if err != nil {
-		logger.Warn("Failed to hash metadata", "err", err)
+		m.Logger.Warn("Failed to hash metadata", "err", err)
 	}
 
 	if m.State != nil {
@@ -380,7 +374,7 @@ func (m *Migrator) copySecretFull(ctx context.Context, srcKey, dstKey string, sr
 		}
 		m.State.UpdateSecret(srcKey, secretState)
 		if err := m.State.Save(m.StateFile); err != nil {
-			logger.Error("failed to save state", "err", err)
+			m.Logger.Error("failed to save state", "err", err)
 		}
 	}
 
@@ -388,7 +382,6 @@ func (m *Migrator) copySecretFull(ctx context.Context, srcKey, dstKey string, sr
 }
 
 func (m *Migrator) copyIncrementalVersions(ctx context.Context, srcKey, dstKey string, srcMeta *kv2MetadataResp, startVersion, endVersion int, opts Options) error {
-	logger := config.SetupLogger(m.LogLevel)
 
 	existingState := m.State.GetSecret(srcKey)
 	versionHashes := make(map[string]string)
@@ -440,7 +433,7 @@ func (m *Migrator) copyIncrementalVersions(ctx context.Context, srcKey, dstKey s
 
 				hash, err := state.HashPayload(payload)
 				if err != nil {
-					logger.Warn("Failed to hash payload", "version", v, "err", err)
+					m.Logger.Warn("Failed to hash payload", "version", v, "err", err)
 				} else {
 					versionHashes[strconv.Itoa(v)] = hash
 				}
@@ -476,7 +469,7 @@ func (m *Migrator) copyIncrementalVersions(ctx context.Context, srcKey, dstKey s
 		srcMeta.Data.CustomMetadata,
 	)
 	if err != nil {
-		logger.Warn("Failed to hash metadata", "err", err)
+		m.Logger.Warn("Failed to hash metadata", "err", err)
 	}
 
 	if m.State != nil {
@@ -491,7 +484,7 @@ func (m *Migrator) copyIncrementalVersions(ctx context.Context, srcKey, dstKey s
 		}
 		m.State.UpdateSecret(srcKey, secretState)
 		if err := m.State.Save(m.StateFile); err != nil {
-			logger.Error("failed to save state", "err", err)
+			m.Logger.Error("failed to save state", "err", err)
 		}
 	}
 
@@ -545,8 +538,8 @@ func (m *Migrator) verifyVersionHashes(ctx context.Context, srcKey, dstKey strin
 }
 
 func (m *Migrator) kv2DeleteSecret(ctx context.Context, c KVV2Cluster, relKey string) error {
-	logger := config.SetupLogger(m.LogLevel)
-	logger.Debug("DELETE", "kvv2-secret", relKey)
+
+	m.Logger.Debug("DELETE", "kvv2-secret", relKey)
 	relKey = trimSlashes(relKey)
 	path := trimSlashes(c.MountPath) + "/metadata/" + relKey
 
@@ -555,8 +548,8 @@ func (m *Migrator) kv2DeleteSecret(ctx context.Context, c KVV2Cluster, relKey st
 }
 
 func (m *Migrator) kv2ReadMetadata(ctx context.Context, c KVV2Cluster, relKey string) (*kv2MetadataResp, error) {
-	logger := config.SetupLogger(m.LogLevel)
-	logger.Debug("READ", "kvv2-metadata", relKey)
+
+	m.Logger.Debug("READ", "kvv2-metadata", relKey)
 	relKey = trimSlashes(relKey)
 	path := trimSlashes(c.MountPath) + "/metadata/" + relKey
 
@@ -578,8 +571,8 @@ func (m *Migrator) kv2ReadMetadata(ctx context.Context, c KVV2Cluster, relKey st
 }
 
 func (m *Migrator) kv2ReadVersion(ctx context.Context, c KVV2Cluster, relKey string, version int) (map[string]any, error) {
-	logger := config.SetupLogger(m.LogLevel)
-	logger.Debug("READ", "kvv2-secret", relKey, "version", version)
+
+	m.Logger.Debug("READ", "kvv2-secret", relKey, "version", version)
 	relKey = trimSlashes(relKey)
 	path := trimSlashes(c.MountPath) + "/data/" + relKey
 
@@ -602,8 +595,8 @@ func (m *Migrator) kv2ReadVersion(ctx context.Context, c KVV2Cluster, relKey str
 }
 
 func (m *Migrator) kv2WriteData(ctx context.Context, c KVV2Cluster, relKey string, data map[string]any) error {
-	logger := config.SetupLogger(m.LogLevel)
-	logger.Debug("WRITE", "kvv2-secret", relKey)
+
+	m.Logger.Debug("WRITE", "kvv2-secret", relKey)
 	relKey = trimSlashes(relKey)
 	path := trimSlashes(c.MountPath) + "/data/" + relKey
 
@@ -640,8 +633,8 @@ func (m *Migrator) kv2DestroyVersions(ctx context.Context, c KVV2Cluster, relKey
 }
 
 func (m *Migrator) kv2WriteMetadataSettings(ctx context.Context, c KVV2Cluster, relKey string, meta *kv2MetadataResp) error {
-	logger := config.SetupLogger(m.LogLevel)
-	logger.Debug("WRITE", "kvv2-metadata", relKey)
+
+	m.Logger.Debug("WRITE", "kvv2-metadata", relKey)
 	relKey = trimSlashes(relKey)
 	path := trimSlashes(c.MountPath) + "/metadata/" + relKey
 

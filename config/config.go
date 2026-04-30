@@ -7,19 +7,20 @@ import (
 )
 
 type VaultClientConfig struct {
-	SrcAddr       string
-	SrcToken      string
-	SrcNamespace  string
-	DstAddr       string
-	DstToken      string
-	DstNamespace  string
-	TlsSkipVerify bool
-	Mode          string
-	LogLevel      string
-	StateFile     string
-	NoState       bool
-	ForceRecopy   bool
-	MaxRetries    int
+	SrcAddr         string
+	SrcToken        string
+	SrcNamespace    string
+	DstAddr         string
+	DstToken        string
+	DstNamespace    string
+	TlsSkipVerify   bool
+	Mode            string
+	LogLevel        string
+	StateFile       string
+	NoState         bool
+	ForceRecopy     bool
+	MaxRetries      int
+	ContinueOnError bool
 }
 
 type SetFlags map[string]bool
