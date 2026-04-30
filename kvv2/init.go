@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"vault-migrate/config"
+	"vault-migrate/state"
 
 	"github.com/hashicorp/vault/api"
 )
@@ -15,9 +16,12 @@ type KVV2Cluster struct {
 }
 
 type Migrator struct {
-	Src      KVV2Cluster
-	Dst      KVV2Cluster
-	LogLevel string
+	Src       KVV2Cluster
+	Dst       KVV2Cluster
+	LogLevel  string
+	Config    config.VaultClientConfig
+	State     *state.MigrationState
+	StateFile string
 }
 
 type Options struct {
@@ -25,7 +29,7 @@ type Options struct {
 	Placeholder     map[string]any
 }
 
-func Init(srcClient, dstClient *api.Client, logLevel string) error {
+func Init(srcClient, dstClient *api.Client, cfg config.VaultClientConfig) error {
 	var srcCluster KVV2Cluster
 	var dstCluster KVV2Cluster
 
@@ -48,19 +52,70 @@ func Init(srcClient, dstClient *api.Client, logLevel string) error {
 	var m Migrator
 	m.Src = srcCluster
 	m.Dst = dstCluster
-	m.LogLevel = logLevel
+	m.LogLevel = cfg.LogLevel
+	m.Config = cfg
+	m.StateFile = cfg.StateFile
 
-	logger := config.SetupLogger(logLevel)
+	logger := config.SetupLogger(cfg.LogLevel)
+
+	if !cfg.NoState {
+		existingState, err := state.Load(cfg.StateFile)
+		if err != nil {
+			return fmt.Errorf("load state file: %w", err)
+		}
+
+		if existingState != nil {
+			srcInfo := state.ClusterInfo{
+				Address:   cfg.SrcAddr,
+				Namespace: cfg.SrcNamespace,
+				Mount:     srcCluster.MountPath,
+				BasePath:  srcCluster.BasePath,
+			}
+			dstInfo := state.ClusterInfo{
+				Address:   cfg.DstAddr,
+				Namespace: cfg.DstNamespace,
+				Mount:     dstCluster.MountPath,
+				BasePath:  dstCluster.BasePath,
+			}
+
+			if err := existingState.Validate(srcInfo, dstInfo); err != nil {
+				return fmt.Errorf("state validation failed: %w\n\nUse -stateFile to specify different state file or -noState to ignore", err)
+			}
+
+			m.State = existingState
+			logger.Info("Loaded existing state file", "secrets", len(existingState.Secrets))
+		} else {
+			m.State = state.NewMigrationState(
+				state.ClusterInfo{
+					Address:   cfg.SrcAddr,
+					Namespace: cfg.SrcNamespace,
+					Mount:     srcCluster.MountPath,
+					BasePath:  srcCluster.BasePath,
+				},
+				state.ClusterInfo{
+					Address:   cfg.DstAddr,
+					Namespace: cfg.DstNamespace,
+					Mount:     dstCluster.MountPath,
+					BasePath:  dstCluster.BasePath,
+				},
+			)
+			logger.Info("Created new state file")
+		}
+	}
+
 	logger.Debug("Initializing KV-V2 copy")
 	err := m.Run(context.Background(), Options{})
 	if err != nil {
 		logger.Error("migration failed", "err", err)
+		return err
 	}
 	return nil
 }
 
 // Initializes the KVV2 migrator
 func (m *Migrator) Run(ctx context.Context, opts Options) error {
+	logger := config.SetupLogger(m.LogLevel)
+
 	if opts.Placeholder == nil {
 		opts.Placeholder = map[string]any{
 			"_vault_migrate": "placeholder",
@@ -73,15 +128,54 @@ func (m *Migrator) Run(ctx context.Context, opts Options) error {
 		return err
 	}
 
+	logger.Info("Starting migration", "total_secrets", len(keys))
+
+	completed := 0
+	failed := 0
+	skipped := 0
+
 	for i, srcKey := range keys {
 		dstKey := m.dstKeyFor(srcKey)
 
-		if err := m.copyOneSecret(ctx, srcKey, dstKey, opts); err != nil {
+		var copyErr error
+		if m.State != nil && !m.Config.NoState {
+			copyErr = m.copyOneSecretWithState(ctx, srcKey, dstKey, opts)
+		} else {
+			copyErr = m.copyOneSecret(ctx, srcKey, dstKey, opts)
+		}
+
+		if copyErr != nil {
+			failed++
 			if opts.ContinueOnError {
-				fmt.Printf("[WARN] (%d/%d) %q -> %q failed: %v\n", i+1, len(keys), srcKey, dstKey, err)
+				logger.Warn("Copy failed", "progress", fmt.Sprintf("%d/%d", i+1, len(keys)), "src", srcKey, "dst", dstKey, "err", copyErr)
 				continue
 			}
-			return fmt.Errorf("copy %q -> %q: %w", srcKey, dstKey, err)
+			return fmt.Errorf("copy %q -> %q: %w", srcKey, dstKey, copyErr)
+		}
+
+		if m.State != nil {
+			secret := m.State.GetSecret(srcKey)
+			if secret != nil && secret.Status == "skipped" {
+				skipped++
+			} else {
+				completed++
+			}
+		} else {
+			completed++
+		}
+
+		if (i+1)%10 == 0 || i+1 == len(keys) {
+			logger.Info("Progress", "completed", completed, "failed", failed, "skipped", skipped, "total", len(keys))
+		}
+	}
+
+	logger.Info("Migration completed", "total", len(keys), "completed", completed, "failed", failed, "skipped", skipped)
+
+	if m.State != nil && !m.Config.NoState {
+		if err := m.State.Save(m.StateFile); err != nil {
+			logger.Error("failed to save final state", "err", err)
+		} else {
+			logger.Info("State saved", "file", m.StateFile)
 		}
 	}
 

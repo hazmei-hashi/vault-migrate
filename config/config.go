@@ -16,6 +16,10 @@ type VaultClientConfig struct {
 	TlsSkipVerify bool
 	Mode          string
 	LogLevel      string
+	StateFile     string
+	NoState       bool
+	ForceRecopy   bool
+	MaxRetries    int
 }
 
 type SetFlags map[string]bool

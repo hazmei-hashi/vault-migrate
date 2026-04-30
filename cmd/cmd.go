@@ -20,6 +20,10 @@ func Init() {
 	flag.BoolVar(&c.TlsSkipVerify, "tlsSkipVerify", false, "Skip TLS verification of the Vault server certificates")
 	flag.StringVar(&c.Mode, "mode", "kvv2", "Mode of operation")
 	flag.StringVar(&c.LogLevel, "logLevel", "info", "Log level (info or debug)")
+	flag.StringVar(&c.StateFile, "stateFile", ".vault-migrate-state.json", "Path to state file for tracking migration progress")
+	flag.BoolVar(&c.NoState, "noState", false, "Disable state tracking (legacy mode)")
+	flag.BoolVar(&c.ForceRecopy, "forceRecopy", false, "Re-copy secrets even if hashes match")
+	flag.IntVar(&c.MaxRetries, "maxRetries", 3, "Maximum retry attempts for failed secrets")
 	flag.Parse()
 
 	setFlags := make(config.SetFlags)
@@ -37,7 +41,7 @@ func Init() {
 
 	switch c.Mode {
 	case "kvv2":
-		err = kvv2.Init(srcClient, dstClient, c.LogLevel)
+		err = kvv2.Init(srcClient, dstClient, c)
 	default:
 		log.Fatal("Supported modes: kvv2")
 	}
