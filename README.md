@@ -20,6 +20,30 @@ go build
 
 This produces a `vault-migrate` binary in the current directory.
 
+**Run tests:**
+```bash
+go test ./...                    # Run all tests (163 tests, 67.3% coverage)
+go test -v ./...                 # Verbose output
+go test -cover ./...             # With coverage
+go test -coverprofile=coverage.out ./...  # Generate report
+go tool cover -html=coverage.out # View in browser
+
+# Run E2E tests (requires Docker)
+cd test/e2e
+docker-compose up -d             # Start Vault containers
+E2E_TESTS=1 go test -v .         # Run 3 E2E scenarios
+docker-compose down -v           # Stop and clean up
+```
+
+**Test coverage:**
+- 163 test cases across 7 packages
+- 67.3% statement coverage (unit, integration, mock-based migration tests, and E2E)
+- 3 E2E test scenarios with Docker Vault (all passing)
+  - Full migration (multi-version secrets)
+  - Incremental migration (resume with new versions)
+  - Dry-run mode (no writes to destination)
+- Includes fake Vault HTTP harness tests for migration logic and KV wrappers (`kvv2/kvv2_mock_test.go`)
+
 ## Features
 
 ### Core Capabilities

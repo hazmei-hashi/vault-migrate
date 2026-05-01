@@ -44,6 +44,8 @@ func Init(srcClient, dstClient *api.Client, cfg config.VaultClientConfig) error 
 	fmt.Print("Source KV-V2 mount (e.g., 'secret'): ")
 	if scanner.Scan() {
 		srcCluster.MountPath = strings.TrimSpace(scanner.Text())
+	} else if scanner.Err() != nil {
+		return fmt.Errorf("failed to read source mount: %w", scanner.Err())
 	}
 	srcCluster.MountPath = trimSlashes(srcCluster.MountPath)
 	fmt.Printf("  Normalized mount: %s\n", srcCluster.MountPath)
@@ -51,6 +53,8 @@ func Init(srcClient, dstClient *api.Client, cfg config.VaultClientConfig) error 
 	fmt.Print("Source KV-V2 base path (e.g., 'myapp/' or leave empty for root): ")
 	if scanner.Scan() {
 		srcCluster.BasePath = strings.TrimSpace(scanner.Text())
+	} else if scanner.Err() != nil {
+		return fmt.Errorf("failed to read source base path: %w", scanner.Err())
 	}
 	srcCluster.BasePath = trimSlashes(srcCluster.BasePath)
 	if srcCluster.BasePath != "" {
@@ -64,6 +68,8 @@ func Init(srcClient, dstClient *api.Client, cfg config.VaultClientConfig) error 
 	fmt.Print("Destination KV-V2 mount (e.g., 'secret'): ")
 	if scanner.Scan() {
 		dstCluster.MountPath = strings.TrimSpace(scanner.Text())
+	} else if scanner.Err() != nil {
+		return fmt.Errorf("failed to read destination mount: %w", scanner.Err())
 	}
 	dstCluster.MountPath = trimSlashes(dstCluster.MountPath)
 	fmt.Printf("  Normalized mount: %s\n", dstCluster.MountPath)
@@ -71,6 +77,8 @@ func Init(srcClient, dstClient *api.Client, cfg config.VaultClientConfig) error 
 	fmt.Print("Destination KV-V2 base path (e.g., 'myapp-migrated/' or leave empty for root): ")
 	if scanner.Scan() {
 		dstCluster.BasePath = strings.TrimSpace(scanner.Text())
+	} else if scanner.Err() != nil {
+		return fmt.Errorf("failed to read destination base path: %w", scanner.Err())
 	}
 	dstCluster.BasePath = trimSlashes(dstCluster.BasePath)
 	if dstCluster.BasePath != "" {

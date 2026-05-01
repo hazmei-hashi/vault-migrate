@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  vault-source:
+    image: hashicorp/vault:1.18.5
+    container_name: vault-migrate-test-src
+    ports:
+      - "8200:8200"
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: "root-token-source"
+      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
+    cap_add:
+      - IPC_LOCK
+    healthcheck:
+      test: ["CMD", "vault", "status"]
+      interval: 2s
+      timeout: 1s
+      retries: 30
+
+  vault-destination:
+    image: hashicorp/vault:1.18.5
+    container_name: vault-migrate-test-dst
+    ports:
+      - "8300:8200"
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: "root-token-destination"
+      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
+    cap_add:
+      - IPC_LOCK
+    healthcheck:
+      test: ["CMD", "vault", "status"]
+      interval: 2s
+      timeout: 1s
+      retries: 30
+
+networks:
+  default:
+    name: vault-migrate-test
