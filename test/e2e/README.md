@@ -1,70 +1,70 @@
 # End-to-End Tests
 
-E2E tests for vault-migrate using Docker Vault instances.
+E2E suite runs `vault-migrate` against real Vault dev servers in Docker.
+
+## What It Covers
+
+- Full migration of multi-version secrets
+- Incremental migration after new source versions
+- Dry-run mode (no destination writes)
+
+## Test Topology
+
+Defined in `test/e2e/docker-compose.yml`:
+
+- Source Vault: `http://127.0.0.1:8200` (`root-token-source`)
+- Destination Vault: `http://127.0.0.1:8300` (`root-token-destination`)
+- Mount under test: `secret` (KV v2)
+- Vault image: `hashicorp/vault:1.18.5`
 
 ## Prerequisites
 
-- Docker and Docker Compose installed
+- Docker
+- Docker Compose (`docker-compose` or `docker compose`)
 - Go 1.25.5+
 
-## Running E2E Tests
+## Run Tests (Manual)
 
-**Manual approach (recommended):**
+From repository root:
+
 ```bash
-# 1. Start Vault containers
-docker-compose up -d
-
-# 2. Wait for containers to be ready
-sleep 5
-
-# 3. Build binary
-cd ../..
-go build -o vault-migrate
-
-# 4. Run tests (from e2e directory)
-cd test/e2e
-E2E_TESTS=1 go test -v -timeout=5m .
-
-# 5. Cleanup
-docker-compose down -v
+docker-compose -f test/e2e/docker-compose.yml up -d
+E2E_TESTS=1 go test -v -timeout=5m ./test/e2e
+docker-compose -f test/e2e/docker-compose.yml down -v
 ```
 
-**Quick run script:**
+Notes:
+
+- E2E tests are skipped unless `E2E_TESTS=1`.
+- Tests assume Vault containers are already running.
+- Each test uses a temp working directory and state file (`state.json`).
+
+## Run Helper Script
+
+From `test/e2e`:
+
 ```bash
 ./run-e2e.sh
 ```
-*Note: Automated script has container lifecycle issues, use manual approach if script fails.*
 
-## Test Coverage
-
-E2E tests cover:
-- ✅ **Full migration** - Copy all secrets with multiple versions
-- ✅ **Incremental migration** - Add new versions and re-run
-- ✅ **Dry-run mode** - Verify no writes to destination
-
-## Architecture
-
-- **Source Vault**: `http://127.0.0.1:8200` (token: `root-token-source`)
-- **Destination Vault**: `http://127.0.0.1:8300` (token: `root-token-destination`)
-- **Mount**: `secret` (KV v2)
+`run-e2e.sh` builds binary and runs tests, but does not start/stop Docker containers.
 
 ## Troubleshooting
 
-**Containers not starting:**
+Containers unhealthy or not reachable:
+
 ```bash
-docker-compose logs
+docker-compose -f test/e2e/docker-compose.yml ps
+docker-compose -f test/e2e/docker-compose.yml logs
 ```
 
-**Port conflicts:**
-Edit `docker-compose.yml` to use different ports.
+Port conflicts (8200/8300):
 
-**Tests fail to connect:**
-Ensure containers are healthy:
-```bash
-docker-compose ps
-```
+- Adjust host ports in `test/e2e/docker-compose.yml`.
+- Update constants in `test/e2e/e2e_test.go` if ports change.
 
-**Cleanup stuck containers:**
+Cleanup:
+
 ```bash
-docker-compose down -v --remove-orphans
+docker-compose -f test/e2e/docker-compose.yml down -v --remove-orphans
 ```

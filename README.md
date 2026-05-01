@@ -1,432 +1,201 @@
 # vault-migrate
 
-`vault-migrate` is a utility for migrating (copying) HashiCorp Vault KV v2 secrets between clusters or namespaces with **intelligent state tracking and incremental migration support**.
+`vault-migrate` copies HashiCorp Vault KV v2 secrets between clusters or namespaces.
 
-It is designed to operate one secret at a time, so memory usage stays bounded even for very large KV trees. Secrets are never written to storage.
+Core behavior:
+- Walks source KV v2 tree recursively from a base path.
+- Replays secret versions in order.
+- Mirrors deleted and destroyed version state.
+- Copies KV metadata settings (`cas_required`, `max_versions`, `delete_version_after`, `custom_metadata`).
+- Supports local state file for incremental re-runs.
 
-## Installation
+Memory model:
+- Processes one secret at a time.
+- Processes one version at a time.
+- Reads version payload, writes payload, then drops local payload reference before next version.
 
-**Prerequisites:**
-- Go 1.25.5 or later
-- Network access to source and destination Vault clusters
-- Valid Vault tokens with appropriate permissions (see Token Requirements below)
+No secret values are written to the state file.
 
-**Build from source:**
+## Requirements
+
+- Go 1.25.5+
+- Network reachability to source and destination Vault clusters
+- Source and destination tokens with required policies
+- KV v2 mounts on both source and destination
+
+## Build
+
 ```bash
-git clone <repository-url>
-cd vault-migrate
 go build
 ```
 
-This produces a `vault-migrate` binary in the current directory.
+Binary output: `./vault-migrate`.
 
-**Run tests:**
+## Test
+
+Run unit/integration tests:
+
 ```bash
-go test ./...                    # Run all tests (163 tests, 67.3% coverage)
-go test -v ./...                 # Verbose output
-go test -cover ./...             # With coverage
-go test -coverprofile=coverage.out ./...  # Generate report
-go tool cover -html=coverage.out # View in browser
-
-# Run E2E tests (requires Docker)
-cd test/e2e
-docker-compose up -d             # Start Vault containers
-E2E_TESTS=1 go test -v .         # Run 3 E2E scenarios
-docker-compose down -v           # Stop and clean up
+go test ./...
+go test -v ./...
+go test -cover ./...
+go test -coverprofile=coverage.out ./...
+go tool cover -html=coverage.out
 ```
 
-**Test coverage:**
-- 163 test cases across 7 packages
-- 67.3% statement coverage (unit, integration, mock-based migration tests, and E2E)
-- 3 E2E test scenarios with Docker Vault (all passing)
-  - Full migration (multi-version secrets)
-  - Incremental migration (resume with new versions)
-  - Dry-run mode (no writes to destination)
-- Includes fake Vault HTTP harness tests for migration logic and KV wrappers (`kvv2/kvv2_mock_test.go`)
+Run E2E tests (Docker required):
 
-## Features
+```bash
+cd test/e2e
+docker-compose up -d
+E2E_TESTS=1 go test -v -timeout=5m .
+docker-compose down -v
+```
 
-### Core Capabilities
-- Recursive walk of a KV v2 tree under a configurable base path
-- Replays every version in order to preserve version numbers
-- Mirrors deleted and destroyed versions
-- Copies KV v2 metadata settings and custom metadata
-- Works across Vault Enterprise namespaces
-- Can migrate entire mounts or a subtree under a given mount to a destination mount or subtree
+Helper script also exists:
 
-### State Tracking & Incremental Migration (NEW)
-- **Intelligent state tracking**: Tracks migration progress in a local JSON file
-- **Incremental copy**: Only copies new versions that don't exist at destination
-- **Resume capability**: Automatically retries failed secrets on re-run
-- **Hash verification**: Uses SHA256 hashes to detect changes without storing secret values
-- **Progress visibility**: Real-time progress logging (completed/failed/skipped counts)
-- **Safe re-runs**: Skips already-migrated secrets to avoid duplication
+```bash
+cd test/e2e
+./run-e2e.sh
+```
 
-Paths are always relative to the mount and must not include data/, metadata/, or the mount name (the latter is supplied separately).
+## Token Policy Requirements
 
-## Token Requirements
+Paths below use your selected mount name in place of `<mount>`.
 
-Both source and destination tokens require policies that allow:
+Source token capabilities:
+- `list`, `read` on `<mount>/metadata/*`
+- `read` on `<mount>/data/*`
 
-**Source token:**
-- `read` permission on `<mount>/metadata/*` (to list and read metadata)
-- `read` permission on `<mount>/data/*` (to read secret versions)
-
-**Destination token:**
-- `create` and `update` permissions on `<mount>/metadata/*` (to write metadata)
-- `create` and `update` permissions on `<mount>/data/*` (to write secret data)
-- `delete` permission on `<mount>/metadata/*` and `<mount>/data/*` (to mirror deleted versions and recreate on hash mismatch)
-- `destroy` permission on `<mount>/metadata/*` (to mirror destroyed versions, if applicable)
-
-## Limitations
-
-- Destroyed versions cannot be recovered (but their destroyed state is mirrored)
-- Source version timestamps cannot be reflected on the destination
-- Requires Vault tokens for the source and destination clusters that have attached policies capable of performing the intended actions
-- Tokens are not renewed, so TTLs must meet or exceed the utility's run duration
-- Designed for KV v2 only
-- State file concurrent access is not supported (use different `-stateFile` paths for parallel migrations)
+Destination token capabilities:
+- `create`, `update` on `<mount>/data/*`
+- `create`, `update` on `<mount>/metadata/*`
+- `update` on `<mount>/delete/*`
+- `update` on `<mount>/destroy/*`
+- `delete` on `<mount>/metadata/*` (used when recreating destination secret)
 
 ## Usage
 
 ### Quick Start
 
-**Basic migration with state tracking (recommended):**
+Minimal command:
+
 ```bash
 ./vault-migrate \
   -srcAddr https://vault-source.example.com:8200 \
-  -srcToken hvs.CAESIGFb... \
+  -dstAddr https://vault-dest.example.com:8200
+```
+
+`-srcAddr` and `-dstAddr` are required. Other missing values prompt interactively.
+
+### Fully Non-Interactive Example
+
+```bash
+./vault-migrate \
+  -srcAddr https://vault-source.example.com:8200 \
+  -srcToken "$SRC_TOKEN" \
   -srcNamespace admin \
   -dstAddr https://vault-dest.example.com:8200 \
-  -dstToken hvs.CAESIH9w... \
-  -dstNamespace admin
+  -dstToken "$DST_TOKEN" \
+  -dstNamespace admin \
+  -tlsSkipVerify \
+  -logLevel info
 ```
 
-The tool will prompt for mount paths and base paths, then:
-- Create `.vault-migrate-state.json` to track progress
-- Copy all secrets incrementally
-- Show real-time progress bar (INFO level) or detailed logs (DEBUG level)
-- Skip already-migrated secrets on re-run
+After startup, tool prompts for:
+- Source KV v2 mount and base path
+- Destination KV v2 mount and base path
 
-**Resume a failed migration:**
-```bash
-# Just re-run the same command - it will automatically:
-# - Load existing state file
-# - Skip completed secrets
-# - Retry failed secrets
-# - Copy any new versions added since last run
-./vault-migrate -srcAddr https://vault-source.example.com:8200 ...
-```
+Path rules:
+- Paths are relative to mount.
+- Do not include `data/`, `metadata/`, or mount name inside base path values.
 
-### Command-Line Flags
+### Flags
 
 ```bash
   -srcAddr string
-        Source cluster API address
+        Source cluster API address (required)
   -srcToken string
         Source cluster token
   -srcNamespace string
         Source cluster namespace
   -dstAddr string
-        Destination cluster API address
+        Destination cluster API address (required)
   -dstToken string
         Destination cluster token
   -dstNamespace string
         Destination cluster namespace
   -tlsSkipVerify
-        Skip TLS verification of the Vault server certificates
+        Skip TLS verification of Vault server certificates
   -logLevel string
-        Log level (info or debug) (default "info")
+        Log level: debug, info, warn, error (default "info")
   -mode string
         Mode of operation (default "kvv2")
   -stateFile string
-        Path to state file for tracking migration progress (default ".vault-migrate-state.json")
+        Path to migration state file (default ".vault-migrate-state.json")
   -noState
-        Disable state tracking (legacy mode)
+        Disable state tracking
   -forceRecopy
-        Re-copy secrets even if hashes match
+        Re-copy when state indicates hashes already match
   -maxRetries int
-        Maximum retry attempts for failed secrets (default 3)
+        Accepted and validated (>=0); currently not enforced as retry cap
   -continueOnError
-        Continue migration even if individual secrets fail
+        Continue migration after per-secret copy errors
   -dryRun
-        Preview migration without making changes
+        Show what would be copied without writing destination
 ```
 
-### Running with Flags
+## Migration Behavior
 
-**Standard migration with state tracking:**
-```bash
-./vault-migrate \
-  -srcAddr https://vault-source.example.com:8200 \
-  -srcToken hvs.CAESIGFb... \
-  -srcNamespace admin \
-  -dstAddr https://vault-dest.example.com:8200 \
-  -dstToken hvs.CAESIH9w... \
-  -dstNamespace admin \
-  -logLevel info
-```
+### Default Mode (`-noState=false`)
 
-**Advanced options:**
-```bash
-# Preview migration without making changes
-./vault-migrate -dryRun ...
+State file stores:
+- Per-secret status (`completed`, `failed`, `skipped`)
+- Version hashes (SHA256)
+- Version state (`active`, `deleted`, `destroyed`, `missing`, `read_error`)
+- Metadata checksum
+- Summary counters
 
-# Custom state file location
-./vault-migrate -stateFile /path/to/migration-state.json ...
+Per-secret behavior:
 
-# Force re-copy even if secrets haven't changed
-./vault-migrate -forceRecopy ...
+1. Destination secret missing
+- Full copy from version `1..N`.
 
-# Continue on errors (don't stop if individual secrets fail)
-./vault-migrate -continueOnError ...
+2. Destination and source have same max version
+- If existing state has version hashes and `-forceRecopy=false`, tool can skip.
+- If no hash state, tool compares source/destination payload hashes.
+- On mismatch, destination secret metadata path is deleted, then full copy runs.
 
-# Disable state tracking (legacy behavior)
-./vault-migrate -noState ...
+3. Destination has fewer versions than source
+- Tool copies only missing tail versions (`dstMax+1..srcMax`).
 
-# Change max retry attempts for failed secrets
-./vault-migrate -maxRetries 5 ...
+4. Destination has more versions than source
+- Secret marked failed.
+- Migration returns error for that secret.
+- With `-continueOnError`, migration continues to next secret.
 
-# Skip TLS verification for development
-./vault-migrate -tlsSkipVerify ...
+### Legacy Mode (`-noState=true`)
 
-# Enable debug logging
-./vault-migrate -logLevel debug ...
-```
+- Tool replays all source versions for every secret every run.
+- Existing destination secrets get additional versions.
+- Re-run is not idempotent on same destination path.
 
-### Interactive Mode
+## Progress and Logging
 
-Run without flags and the tool will prompt for missing values:
+- `info` level: progress bar on TTY, periodic progress logs on non-TTY.
+- `debug` level: per-operation logs (`READ`, `WRITE`, `FULL COPY`, `INCREMENTAL COPY`, `SKIP`, `RECREATE`).
 
-```bash
-./vault-migrate
-```
+## Limitations
 
-Example prompts:
-```
-Source Vault API address: https://vault-source.example.com:8200
-Source Vault token: [hidden input]
-Source namespace: admin
-Destination Vault API address: https://vault-dest.example.com:8200
-Destination Vault token: [hidden input]
-Destination namespace: admin
-Skip TLS verification? (y/n): y
-Source KV-V2 mount: secret
-Source KV-V2 base path: myapp/
-Destination KV-V2 mount: secret
-Destination KV-V2 base path: myapp-migrated/
-```
+- KV v2 mode only (`-mode kvv2`).
+- Source version timestamps are not preserved on destination.
+- Destroyed source payloads are unrecoverable; tool writes placeholder then marks destination version destroyed.
+- Token renewal is not handled; token TTL must exceed migration duration.
+- State file is single-writer; do not share one `-stateFile` across parallel migrations.
+- Vault client timeout is 3 seconds per request.
 
-**Note:** Tokens are read securely with hidden input. Mount and base paths are **relative to the mount** and should not include `data/`, `metadata/`, or the mount name.
+## Security Notes
 
-### Progress Display
-
-The tool provides different levels of progress feedback based on the log level:
-
-**INFO Level (default):**
-- Clean, in-place progress bar in terminal environments
-- Shows: `Progress: [████████░░] 50% (125/250) - 120 completed, 3 failed, 2 skipped`
-- Updates throttled to 100ms intervals for performance
-- Fallback to periodic line logging in CI/CD environments (non-TTY)
-
-**DEBUG Level:**
-- Detailed per-secret operation logs
-- Shows: `FULL COPY`, `INCREMENTAL COPY`, `SKIP (already migrated)`, `RECREATE (hash mismatch)`
-- Additional metadata and API operation details
-
-**Example output (INFO level):**
-```
-Starting migration total_secrets=250 dry_run=false
-Progress: [████████████████████░░░░░░░░░░░░░░░░░░░░] 50% (125/250) - 120 completed, 3 failed, 2 skipped
-Migration completed total=250 completed=242 failed=5 skipped=3
-State saved file=.vault-migrate-state.json
-```
-
-## Behavior and Re-run Considerations
-
-### State Tracking (NEW)
-
-**As of the latest version**, the tool now tracks migration progress in a local state file (`.vault-migrate-state.json` by default). This enables:
-
-- **Incremental migrations**: Only copy new versions that don't exist at the destination
-- **Resume capability**: Automatically retry failed secrets on re-run
-- **Skip already-migrated secrets**: Avoid redundant copying using SHA256 hash verification
-- **Progress visibility**: See what was migrated, failed, or skipped
-
-#### State File Contents
-
-The state file stores (NO actual secret values are saved):
-- SHA256 hashes of each version's payload for comparison
-- Version states (active/deleted/destroyed)
-- Metadata checksums
-- Migration status per secret (completed/failed/skipped)
-- Timestamps and retry counts
-
-**Example state file structure:**
-```json
-{
-  "version": "1.0",
-  "migration_id": "migration_2026-04-30T10:30:00Z",
-  "source": {
-    "address": "https://vault-src:8200",
-    "namespace": "admin",
-    "mount": "secret",
-    "base_path": "myapp/"
-  },
-  "destination": {
-    "address": "https://vault-dst:8200",
-    "namespace": "admin",
-    "mount": "secret",
-    "base_path": "myapp-migrated/"
-  },
-  "secrets": {
-    "myapp/db/password": {
-      "status": "completed",
-      "source_version_count": 5,
-      "dest_version_count": 5,
-      "version_hashes": {
-        "1": "sha256:abc123...",
-        "2": "sha256:def456..."
-      },
-      "version_states": {
-        "1": "active",
-        "2": "deleted"
-      },
-      "metadata_checksum": "sha256:xyz789...",
-      "migrated_at": "2026-04-30T10:31:15Z"
-    }
-  },
-  "summary": {
-    "total": 250,
-    "completed": 248,
-    "failed": 1,
-    "skipped": 1,
-    "started_at": "2026-04-30T10:30:00Z",
-    "last_updated_at": "2026-04-30T10:45:00Z"
-  }
-}
-```
-
-#### Migration Behavior with State Tracking
-
-When state tracking is enabled (default):
-
-**1. New Secret (destination doesn't exist)**
-- Performs full copy of all versions
-- Records hashes and states in state file
-
-**2. Destination has fewer versions than source**
-- Compares existing version hashes
-- If hashes match: Copies only NEW versions incrementally (e.g., if source has v1-v7 and dest has v1-v5, only copies v6-v7)
-- If hashes mismatch: Destroys destination and performs full copy from source
-
-**3. Same version count**
-- **With state hashes (fast path)**: Compares version hashes from state file
-  - If all match: Skips (already migrated)
-  - If any differ: Destroys destination and performs full copy from source
-- **Without state hashes (slow path)**: Reads and compares actual secret data
-  - Computes SHA256 hashes of source and destination versions
-  - If all match: Skips (destination already has correct data)
-  - If any differ: Destroys destination and performs full copy from source
-  - **Note**: This ensures correct behavior even when migrating to pre-existing secrets
-
-**4. Destination ahead of source**
-- Logs error (manual review needed)
-- Skips the secret
-
-**Smart Skip Behavior:**
-The tool intelligently detects when destination secrets already match the source, even without a state file. This prevents unnecessary re-copying when:
-- Running migration multiple times without state tracking
-- Migrating to a destination that was previously populated
-- Recovering from a partial migration
-
-#### Disabling State Tracking
-
-To use legacy behavior (unconditional overwrite):
-
-```bash
-./vault-migrate -noState ...
-```
-
-#### Multiple Migrations
-
-**IMPORTANT**: Running multiple migrations with the same state file is unsupported. Use different `-stateFile` paths for parallel or separate migrations:
-
-```bash
-./vault-migrate -stateFile .state-migration-1.json ...
-./vault-migrate -stateFile .state-migration-2.json ...
-```
-
-### Overwrite Behavior (Legacy Mode)
-
-When state tracking is disabled with `-noState`:
-
-**WARNING:** This tool does NOT check if secrets already exist at the destination. It will **unconditionally overwrite** any existing secrets at the destination path.
-
-- Running the tool multiple times will re-migrate all secrets
-- Existing secrets at the destination with the same path will be overwritten
-- This is **not idempotent** - each run creates new versions
-
-### Version Handling
-
-#### With State Tracking (Default)
-
-The tool intelligently handles versions based on what exists at the destination:
-
-- **Incremental copy**: If destination has v1-v5 and source has v1-v7, only copies v6-v7
-- **Version preservation**: Version numbers always match between source and destination
-- **Hash verification**: Compares SHA256 hashes to detect if existing versions match
-
-#### Without State Tracking (Legacy Mode with `-noState`)
-
-The tool replays every version from the source in sequential order (v1, v2, v3, etc.). 
-
-**If running on an existing destination:**
-- Each write creates a **new version** at the destination
-- Version numbers will NOT match the source if the destination secret already exists
-- Example: If destination already has v1-v5, a re-run will create v6-v10 (not replace v1-v5)
-
-**For a fresh destination:**
-- Version numbers will match the source (v1 at source = v1 at destination)
-
-### Metadata Settings
-
-The tool overwrites the destination's metadata settings with those from the source:
-- `cas_required` - Check-and-Set requirement
-- `max_versions` - Maximum number of versions to keep
-- `delete_version_after` - Automatic deletion duration
-- `custom_metadata` - User-defined metadata fields
-
-Any existing metadata configuration at the destination will be replaced.
-
-### Re-running the Tool
-
-#### With State Tracking (Default)
-
-**✅ Safe to re-run**: The tool automatically:
-- Skips secrets that haven't changed (hash verification)
-- Copies only new versions incrementally
-- Retries failed secrets (up to `-maxRetries` attempts)
-- Shows progress summary (completed/failed/skipped counts)
-
-**Common scenarios:**
-- **Network failure mid-migration**: Re-run to resume from state file
-- **Source updated after migration**: Re-run to copy new versions incrementally
-- **Failed secrets**: Automatically retried on re-run
-
-**Force re-copy**: Use `-forceRecopy` to re-migrate even if hashes match
-
-#### Without State Tracking (Legacy Mode)
-
-**⚠️ Warning:** Re-running the migration on the same source/destination is generally **not recommended** because:
-
-1. It will create duplicate versions at the destination
-2. It wastes API calls and time re-migrating already-copied secrets
-3. It may cause confusion about which versions correspond to source versions
-
-**When to re-run:**
-- After a failed migration (if some secrets were not copied)
-- When migrating to a different destination base path
-- When source secrets have been updated and you want to capture new versions
-
-**Recommendation:** Use different destination base paths for different migration runs, or manually clean up the destination before re-running.
+- Avoid passing tokens directly in shell history; prefer environment variables.
+- Interactive token prompts use hidden terminal input.
+- State file stores hashes and metadata checksums, not secret values.
