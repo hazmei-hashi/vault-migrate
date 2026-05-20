@@ -37,7 +37,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git fetch --no-tags "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "+refs/heads/main:refs/remotes/origin/main"
+          AUTHED_REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags "$AUTHED_REMOTE" "+refs/heads/main:refs/remotes/origin/main"
           TAG_COMMIT="$(git rev-parse "$GITHUB_SHA^{commit}")"
           if ! git merge-base --is-ancestor "$TAG_COMMIT" origin/main; then
             echo "Release tag commit must be reachable from main"
