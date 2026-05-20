@@ -27,3 +27,5 @@ go.work.sum
 *-state-*.json
 *-state.json
 vault-migrate
+.tmp/
+dist/

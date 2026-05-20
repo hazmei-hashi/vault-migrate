@@ -31,6 +31,71 @@ go build
 
 Binary output: `./vault-migrate`.
 
+
+## Releases
+
+### Creating a Release
+
+Releases are created via GitHub Actions:
+
+1. Navigate to the **Actions** tab in GitHub
+2. Select **"Create Release Tag"** workflow
+3. Click **"Run workflow"**
+4. Select the `main` branch and enter semantic version (e.g., `v1.0.0`)
+5. Click **"Run workflow"** button
+
+This triggers:
+- Tag creation on `main` branch
+- Validation that release tags point to commits reachable from `main`
+- `go test ./...` before packaging
+- GoReleaser binary builds for multiple platforms
+- GitHub release creation and publishing after assets, SHA256 checksums, and artifact attestations are ready
+
+### Available Binaries
+
+Each release includes pre-built binaries for:
+- **Linux**: amd64, arm64
+- **macOS**: amd64 (Intel), arm64 (Apple Silicon)
+- **Windows**: amd64
+
+Binary naming: `vault-migrate-{tag}-{os}-{arch}{extension}`
+
+Examples:
+- `vault-migrate-v1.0.0-darwin-arm64`
+- `vault-migrate-v1.0.0-windows-amd64.exe`
+
+### Verifying Downloads
+
+Each release includes a combined GoReleaser `checksums.txt`:
+
+```bash
+# Download binary and checksums
+curl -LO https://github.com/hazmei-hashi/vault-migrate/releases/download/v1.0.0/vault-migrate-v1.0.0-linux-amd64
+curl -LO https://github.com/hazmei-hashi/vault-migrate/releases/download/v1.0.0/checksums.txt
+
+# Verify checksum
+grep 'vault-migrate-v1.0.0-linux-amd64$' checksums.txt | sha256sum -c -
+```
+
+Release binaries also include GitHub artifact attestations. Verify provenance with GitHub CLI:
+
+```bash
+gh attestation verify vault-migrate-v1.0.0-linux-amd64 \
+  --repo hazmei-hashi/vault-migrate
+```
+
+### Manual Tag Creation
+
+Alternatively, create tags manually from a commit already on `main` to trigger builds:
+
+```bash
+git tag -a v1.0.0 -m "Release v1.0.0"
+git push origin v1.0.0
+```
+
+Tags that are not reachable from `main` fail release validation.
+
+
 ## Test
 
 Run unit/integration tests:
