@@ -41,13 +41,15 @@ Releases are created via GitHub Actions:
 1. Navigate to the **Actions** tab in GitHub
 2. Select **"Create Release Tag"** workflow
 3. Click **"Run workflow"**
-4. Enter semantic version (e.g., `v1.0.0`)
+4. Select the `main` branch and enter semantic version (e.g., `v1.0.0`)
 5. Click **"Run workflow"** button
 
 This triggers:
 - Tag creation on `main` branch
-- Automatic binary builds for multiple platforms
-- GitHub release with downloadable artifacts
+- Validation that release tags point to commits reachable from `main`
+- `go test ./...` before packaging
+- GoReleaser binary builds for multiple platforms
+- GitHub release with downloadable artifacts, SHA256 checksums, and artifact attestations
 
 ### Available Binaries
 
@@ -62,25 +64,34 @@ Example: `vault-migrate-v1.0.0-darwin-arm64`
 
 ### Verifying Downloads
 
-Each binary includes a SHA256 checksum file (`.sha256`):
+Each release includes a combined GoReleaser `checksums.txt`:
 
 ```bash
-# Download binary and checksum
+# Download binary and checksums
 curl -LO https://github.com/hazmei-hashi/vault-migrate/releases/download/v1.0.0/vault-migrate-v1.0.0-linux-amd64
-curl -LO https://github.com/hazmei-hashi/vault-migrate/releases/download/v1.0.0/vault-migrate-v1.0.0-linux-amd64.sha256
+curl -LO https://github.com/hazmei-hashi/vault-migrate/releases/download/v1.0.0/checksums.txt
 
 # Verify checksum
-sha256sum -c vault-migrate-v1.0.0-linux-amd64.sha256
+grep 'vault-migrate-v1.0.0-linux-amd64$' checksums.txt | sha256sum -c -
+```
+
+Release binaries also include GitHub artifact attestations. Verify provenance with GitHub CLI:
+
+```bash
+gh attestation verify vault-migrate-v1.0.0-linux-amd64 \
+  --repo hazmei-hashi/vault-migrate
 ```
 
 ### Manual Tag Creation
 
-Alternatively, create tags manually to trigger builds:
+Alternatively, create tags manually from a commit already on `main` to trigger builds:
 
 ```bash
 git tag -a v1.0.0 -m "Release v1.0.0"
 git push origin v1.0.0
 ```
+
+Tags that are not reachable from `main` fail release validation.
 
 
 ## Test
