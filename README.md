@@ -49,7 +49,7 @@ This triggers:
 - Validation that release tags point to commits reachable from `main`
 - `go test ./...` before packaging
 - GoReleaser binary builds for multiple platforms
-- GitHub release with downloadable artifacts, SHA256 checksums, and artifact attestations
+- GitHub release creation and publishing after assets, SHA256 checksums, and artifact attestations are ready
 
 ### Available Binaries
 
@@ -58,9 +58,11 @@ Each release includes pre-built binaries for:
 - **macOS**: amd64 (Intel), arm64 (Apple Silicon)
 - **Windows**: amd64
 
-Binary naming: `vault-migrate-{version}-{os}-{arch}[.exe]`
+Binary naming: `vault-migrate-{tag}-{os}-{arch}{extension}`
 
-Example: `vault-migrate-v1.0.0-darwin-arm64`
+Examples:
+- `vault-migrate-v1.0.0-darwin-arm64`
+- `vault-migrate-v1.0.0-windows-amd64.exe`
 
 ### Verifying Downloads
 
