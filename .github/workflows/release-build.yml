@@ -1,0 +1,74 @@
+name: Build and Package Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build Binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            goos: linux
+            goarch: amd64
+          - os: linux
+            arch: arm64
+            goos: linux
+            goarch: arm64
+          - os: darwin
+            arch: amd64
+            goos: darwin
+            goarch: amd64
+          - os: darwin
+            arch: arm64
+            goos: darwin
+            goarch: arm64
+          - os: windows
+            arch: amd64
+            goos: windows
+            goarch: amd64
+            ext: .exe
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+      
+      - name: Get version
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+      
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          BINARY_NAME="vault-migrate-${{ steps.version.outputs.VERSION }}-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}"
+          go build -ldflags="-s -w" -o "$BINARY_NAME"
+          
+          # Generate checksum
+          sha256sum "$BINARY_NAME" > "$BINARY_NAME.sha256"
+          
+          echo "BINARY_NAME=$BINARY_NAME" >> $GITHUB_ENV
+      
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.BINARY_NAME }}
+            ${{ env.BINARY_NAME }}.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
