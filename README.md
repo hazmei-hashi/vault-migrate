@@ -177,38 +177,27 @@ Path rules:
 
 ### Flags
 
-```bash
-  -srcAddr string
-        Source cluster API address (required)
-  -srcToken string
-        Source cluster token
-  -srcNamespace string
-        Source cluster namespace
-  -dstAddr string
-        Destination cluster API address (required)
-  -dstToken string
-        Destination cluster token
-  -dstNamespace string
-        Destination cluster namespace
-  -tlsSkipVerify
-        Skip TLS verification of Vault server certificates
-  -logLevel string
-        Log level: debug, info, warn, error (default "info")
-  -mode string
-        Mode of operation (default "kvv2")
-  -stateFile string
-        Path to migration state file (default ".vault-migrate-state.json")
-  -noState
-        Disable state tracking
-  -forceRecopy
-        Re-copy when state indicates hashes already match
-  -maxRetries int
-        Accepted and validated (>=0); currently not enforced as retry cap
-  -continueOnError
-        Continue migration after per-secret copy errors
-  -dryRun
-        Show what would be copied without writing destination
-```
+The CLI supports these flags:
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `-srcAddr` | required | Source cluster API address |
+| `-srcToken` | prompt | Source cluster token |
+| `-srcNamespace` | prompt | Source cluster namespace |
+| `-dstAddr` | required | Destination cluster API address |
+| `-dstToken` | prompt | Destination cluster token |
+| `-dstNamespace` | prompt | Destination cluster namespace |
+| `-tlsSkipVerify` | `false` | Skip TLS verification of Vault server certificates |
+| `-mode` | `kvv2` | Mode of operation. Currently only `kvv2` is supported |
+| `-logLevel` | `info` | Log level: `debug`, `info`, `warn`, `error` |
+| `-stateFile` | `.vault-migrate-state.json` | Path to migration state file |
+| `-noState` | `false` | Disable state tracking |
+| `-forceRecopy` | `false` | Re-copy when state indicates hashes already match |
+| `-maxRetries` | `3` | Maximum retry attempts for failed secrets. Accepted and validated as `>= 0` |
+| `-continueOnError` | `false` | Continue migration after per-secret copy errors |
+| `-dryRun` | `false` | Show what would be copied without writing to the destination |
+
+If a flag is omitted, the tool prompts for the missing value at runtime. After startup, it also prompts for the source and destination KV v2 mount and base path.
 
 ## Migration Behavior
 
