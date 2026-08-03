@@ -2,6 +2,7 @@ package kvv2
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -9,6 +10,11 @@ import (
 	"time"
 	"vault-migrate/state"
 )
+
+// errMetadataNotFound sentinels Vault's nil/nil "empty metadata" shape (see
+// kv2ReadMetadata) so isNotFound can match it structurally instead of relying
+// solely on the "not found" substring baked into the wrapped message below.
+var errMetadataNotFound = errors.New("metadata not found")
 
 // walkAllKeys returns leaf secret keys relative to the mount
 func (m *Migrator) walkAllKeys(ctx context.Context, c KVV2Cluster, startPrefix string) ([]string, error) {
@@ -214,7 +220,10 @@ func (m *Migrator) copyOneSecretWithState(ctx context.Context, srcKey, dstKey st
 	srcMaxVersion := getMaxVersion(srcMeta)
 
 	dstMeta, err := m.kv2ReadMetadata(ctx, m.Dst, dstKey)
-	destExists := (err == nil && dstMeta != nil)
+	destExists := err == nil
+	if err != nil && !isNotFound(err) {
+		return fmt.Errorf("read destination metadata: %w", err)
+	}
 
 	if destExists {
 		dstMaxVersion := getMaxVersion(dstMeta)
@@ -611,7 +620,12 @@ func (m *Migrator) kv2ReadMetadata(ctx context.Context, c KVV2Cluster, relKey st
 		return nil, err
 	}
 	if sec == nil || sec.Data == nil {
-		return nil, fmt.Errorf("empty metadata response for %q", path)
+		// Vault's Read() collapses a bare 404 (no warnings/data) into
+		// (nil, nil) rather than an error. Surface it as a "not found"
+		// so callers using isNotFound (e.g. destination-exists checks)
+		// treat a missing secret the same whether the API returned an
+		// explicit 404 error or this nil/nil shape.
+		return nil, fmt.Errorf("%w: empty metadata response for %q", errMetadataNotFound, path)
 	}
 
 	wrapped := map[string]any{"data": sec.Data}

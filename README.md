@@ -18,7 +18,7 @@ No secret values are written to the state file.
 
 ## Requirements
 
-- Go 1.25.5+
+- Go 1.25.5+ (module declares `go 1.25.5`; CI builds/tests on 1.26.x)
 - Network reachability to source and destination Vault clusters
 - Source and destination tokens with required policies
 - KV v2 mounts on both source and destination
@@ -98,6 +98,17 @@ Tags that are not reachable from `main` fail release validation.
 
 ## Test
 
+Test conventions:
+- Table-driven tests (`tests := []struct{...}` + `t.Run` subtests) throughout.
+- `kvv2/kvv2_mock_test.go` provides `newFakeVault` — an `httptest.Server`-backed
+  fake KV v2 backend used by all `kvv2` package unit tests instead of a real
+  Vault cluster.
+- Stdin-driven prompts (`Init`, `config.Prompt`/`PromptRequired`) are tested via
+  a `useStdinInput(t, input)` helper that swaps `os.Stdin` for a pipe pre-loaded
+  with the given input and restores it on cleanup.
+- True end-to-end tests against a live Vault cluster live in `test/e2e/` and
+  are gated behind `E2E_TESTS=1` (skipped otherwise).
+
 Run unit/integration tests:
 
 ```bash
@@ -134,7 +145,8 @@ Source token capabilities:
 
 Destination token capabilities:
 - `create`, `update` on `<mount>/data/*`
-- `create`, `update` on `<mount>/metadata/*`
+- `create`, `update`, `read` on `<mount>/metadata/*`
+- `read` on `<mount>/data/*` (required to verify existing destination secrets before deciding skip/recreate/incremental)
 - `update` on `<mount>/delete/*`
 - `update` on `<mount>/destroy/*`
 - `delete` on `<mount>/metadata/*` (used when recreating destination secret)
@@ -151,7 +163,7 @@ Minimal command:
   -dstAddr https://vault-dest.example.com:8200
 ```
 
-`-srcAddr` and `-dstAddr` are required. Other missing values prompt interactively.
+`-srcAddr` and `-dstAddr` are required; `cmd.validateConfig` fatals immediately if either is missing or malformed, before any prompt runs. Every other value not passed as a flag prompts interactively.
 
 ### Fully Non-Interactive Example
 
@@ -167,9 +179,26 @@ Minimal command:
   -logLevel info
 ```
 
-After startup, tool prompts for:
-- Source KV v2 mount and base path
-- Destination KV v2 mount and base path
+### Prompt Order
+
+Any value not supplied via flag is prompted for, in this exact order (skipping entries already set by flag):
+
+1. Source Vault API address
+2. Source Vault token (hidden input)
+3. Source namespace (empty = root namespace)
+4. Destination Vault API address
+5. Destination Vault token (hidden input)
+6. Destination namespace (empty = root namespace)
+7. Skip TLS verification? (y/n)
+8. Source KV-V2 mount (required; re-prompts on empty or slash-only input)
+9. Source KV-V2 base path (empty = root path, legal)
+10. Destination KV-V2 mount (required; re-prompts on empty or slash-only input)
+11. Destination KV-V2 base path (empty = root path, legal)
+
+Tokens are read via `term.ReadPassword` and require a real TTY (no echo, no
+paste-safe fallback). In CI or any non-interactive environment, pass
+`-srcToken`/`-dstToken` as flags or via environment-sourced flag values —
+piping a token through stdin does not work for the token prompts.
 
 Path rules:
 - Paths are relative to mount.
@@ -182,10 +211,10 @@ The CLI supports these flags:
 | Flag | Default | Purpose |
 |---|---|---|
 | `-srcAddr` | required | Source cluster API address |
-| `-srcToken` | prompt | Source cluster token |
+| `-srcToken` | prompt (TTY only) | Source cluster token |
 | `-srcNamespace` | prompt | Source cluster namespace |
 | `-dstAddr` | required | Destination cluster API address |
-| `-dstToken` | prompt | Destination cluster token |
+| `-dstToken` | prompt (TTY only) | Destination cluster token |
 | `-dstNamespace` | prompt | Destination cluster namespace |
 | `-tlsSkipVerify` | `false` | Skip TLS verification of Vault server certificates |
 | `-mode` | `kvv2` | Mode of operation. Currently only `kvv2` is supported |
@@ -193,18 +222,18 @@ The CLI supports these flags:
 | `-stateFile` | `.vault-migrate-state.json` | Path to migration state file |
 | `-noState` | `false` | Disable state tracking |
 | `-forceRecopy` | `false` | Re-copy when state indicates hashes already match |
-| `-maxRetries` | `3` | Maximum retry attempts for failed secrets. Accepted and validated as `>= 0` |
+| `-maxRetries` | `3` | Validated as `>= 0` at startup, but currently has no effect on migration behavior (no retry loop reads it yet) |
 | `-continueOnError` | `false` | Continue migration after per-secret copy errors |
 | `-dryRun` | `false` | Show what would be copied without writing to the destination |
 
-If a flag is omitted, the tool prompts for the missing value at runtime. After startup, it also prompts for the source and destination KV v2 mount and base path.
+If a flag is omitted, the tool prompts for the missing value at runtime, in the order listed under [Prompt Order](#prompt-order). Empty input at the mount prompts is rejected and re-prompted; empty input at the base path or namespace prompts is accepted and means root.
 
 ## Migration Behavior
 
 ### Default Mode (`-noState=false`)
 
 State file stores:
-- Per-secret status (`completed`, `failed`, `skipped`)
+- Per-secret status (`completed`, `recreated`, `failed`, `skipped`)
 - Version hashes (SHA256)
 - Version state (`active`, `deleted`, `destroyed`, `missing`, `read_error`)
 - Metadata checksum
@@ -251,5 +280,6 @@ Per-secret behavior:
 ## Security Notes
 
 - Avoid passing tokens directly in shell history; prefer environment variables.
-- Interactive token prompts use hidden terminal input.
+- Interactive token prompts use hidden terminal input (`term.ReadPassword`) and require a TTY; use `-srcToken`/`-dstToken` flags or environment-sourced values in CI or any non-interactive context.
 - State file stores hashes and metadata checksums, not secret values.
+- Empty mount input is rejected and re-prompted (never silently accepted); empty base path or namespace input is accepted and means root.
