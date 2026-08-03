@@ -3,6 +3,7 @@ package client
 import (
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"vault-migrate/config"
@@ -16,8 +17,11 @@ func BuildClients(c config.VaultClientConfig, setFlags config.SetFlags) (*api.Cl
 	logger := config.SetupLogger(c.LogLevel)
 
 	if !setFlags.Has("srcAddr") {
-		fmt.Print("Source Vault API address: ")
-		fmt.Scan(&c.SrcAddr)
+		v, err := config.Prompt("Source Vault API address: ")
+		if err != nil {
+			return nil, nil, fmt.Errorf("read source address: %w", err)
+		}
+		c.SrcAddr = v
 	} else {
 		logger.Debug("Found flag", "srcAddr", c.SrcAddr)
 	}
@@ -30,19 +34,25 @@ func BuildClients(c config.VaultClientConfig, setFlags config.SetFlags) (*api.Cl
 		}
 		c.SrcToken = string(data)
 	} else {
-		logger.Debug("Found flag", "srcToken", c.SrcToken)
+		logger.Debug("Found flag", "srcToken", "[redacted]")
 	}
 
 	if !setFlags.Has("srcNamespace") {
-		fmt.Printf("\nSource namespace: ")
-		fmt.Scan(&c.SrcNamespace)
+		v, err := config.Prompt("\nSource namespace: ")
+		if err != nil {
+			return nil, nil, fmt.Errorf("read source namespace: %w", err)
+		}
+		c.SrcNamespace = v
 	} else {
 		logger.Debug("Found flag", "srcNamespace", c.SrcNamespace)
 	}
 
 	if !setFlags.Has("dstAddr") {
-		fmt.Printf("Destination Vault API address: ")
-		fmt.Scan(&c.DstAddr)
+		v, err := config.Prompt("Destination Vault API address: ")
+		if err != nil {
+			return nil, nil, fmt.Errorf("read destination address: %w", err)
+		}
+		c.DstAddr = v
 	} else {
 		logger.Debug("Found flag", "dstAddr", c.DstAddr)
 	}
@@ -55,23 +65,25 @@ func BuildClients(c config.VaultClientConfig, setFlags config.SetFlags) (*api.Cl
 		}
 		c.DstToken = string(data)
 	} else {
-		logger.Debug("Found flag", "dstToken", c.DstToken)
+		logger.Debug("Found flag", "dstToken", "[redacted]")
 	}
 
 	if !setFlags.Has("dstNamespace") {
-		fmt.Printf("\nDestination namespace: ")
-		fmt.Scan(&c.DstNamespace)
+		v, err := config.Prompt("\nDestination namespace: ")
+		if err != nil {
+			return nil, nil, fmt.Errorf("read destination namespace: %w", err)
+		}
+		c.DstNamespace = v
 	} else {
 		logger.Debug("Found flag", "dstNamespace", c.DstNamespace)
 	}
 
 	if !setFlags.Has("tlsSkipVerify") {
-		fmt.Print("Skip TLS verification? (y/n): ")
-		var skipTLS string
-		fmt.Scan(&skipTLS)
-		if skipTLS == "y" {
-			c.TlsSkipVerify = true
+		v, err := config.Prompt("Skip TLS verification? (y/n): ")
+		if err != nil {
+			return nil, nil, fmt.Errorf("read tls skip verify: %w", err)
 		}
+		c.TlsSkipVerify = strings.EqualFold(v, "y") || strings.EqualFold(v, "yes")
 	} else {
 		logger.Debug("Found flag", "tlsSkipVerify", c.TlsSkipVerify)
 	}
@@ -96,7 +108,9 @@ func getClient(address string, token string, namespace string, skipVerify bool) 
 		Address: address,
 	}
 
-	clientConfig.ConfigureTLS(&api.TLSConfig{Insecure: skipVerify})
+	if err := clientConfig.ConfigureTLS(&api.TLSConfig{Insecure: skipVerify}); err != nil {
+		return nil, fmt.Errorf("configure TLS for %s: %w", address, err)
+	}
 	client, err := api.NewClient(clientConfig)
 	if err != nil {
 		log.Fatal(err)
@@ -112,18 +126,19 @@ func getClient(address string, token string, namespace string, skipVerify bool) 
 		log.Fatalf("%s is not initialized, aborting.", address)
 	} else if health.Sealed {
 		log.Fatalf("%s is sealed, aborting.", address)
-	} else {
-		lookup, err := client.Auth().Token().LookupSelf()
-		if err != nil {
-			log.Fatalf("Token lookup failed for %s", address)
-		} else {
-			ttl, _ := lookup.TokenTTL()
-			log.Printf("Found initialized/unsealed cluster %s (Token TTL: %b)\n", health.ClusterID, ttl)
-		}
 	}
 
-	// wait to set namespace until health checks completed
+	// Namespace-scoped Enterprise tokens need the namespace set before
+	// LookupSelf, otherwise lookup is fatal against the wrong namespace.
 	client.SetNamespace(namespace)
+
+	lookup, err := client.Auth().Token().LookupSelf()
+	if err != nil {
+		log.Fatalf("Token lookup failed for %s", address)
+	} else {
+		ttl, _ := lookup.TokenTTL()
+		log.Printf("Found initialized/unsealed cluster %s (Token TTL: %v)\n", health.ClusterID, ttl)
+	}
 
 	return client, nil
 }

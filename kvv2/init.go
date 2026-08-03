@@ -1,12 +1,9 @@
 package kvv2
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
-	"strings"
 	"vault-migrate/config"
 	"vault-migrate/state"
 
@@ -36,27 +33,21 @@ type Options struct {
 }
 
 func Init(srcClient, dstClient *api.Client, cfg config.VaultClientConfig) error {
-	scanner := bufio.NewScanner(os.Stdin)
-
 	var srcCluster KVV2Cluster
 	var dstCluster KVV2Cluster
 
-	fmt.Print("Source KV-V2 mount (e.g., 'secret'): ")
-	if scanner.Scan() {
-		srcCluster.MountPath = strings.TrimSpace(scanner.Text())
-	} else if scanner.Err() != nil {
-		return fmt.Errorf("failed to read source mount: %w", scanner.Err())
+	mount, err := config.PromptRequired("Source KV-V2 mount (e.g., 'secret'): ")
+	if err != nil {
+		return fmt.Errorf("failed to read source mount: %w", err)
 	}
-	srcCluster.MountPath = trimSlashes(srcCluster.MountPath)
+	srcCluster.MountPath = trimSlashes(mount)
 	fmt.Printf("  Normalized mount: %s\n", srcCluster.MountPath)
 
-	fmt.Print("Source KV-V2 base path (e.g., 'myapp/' or leave empty for root): ")
-	if scanner.Scan() {
-		srcCluster.BasePath = strings.TrimSpace(scanner.Text())
-	} else if scanner.Err() != nil {
-		return fmt.Errorf("failed to read source base path: %w", scanner.Err())
+	basePath, err := config.Prompt("Source KV-V2 base path (e.g., 'myapp/' or leave empty for root): ")
+	if err != nil {
+		return fmt.Errorf("failed to read source base path: %w", err)
 	}
-	srcCluster.BasePath = trimSlashes(srcCluster.BasePath)
+	srcCluster.BasePath = trimSlashes(basePath)
 	if srcCluster.BasePath != "" {
 		fmt.Printf("  Normalized path: %s\n", srcCluster.BasePath)
 	} else {
@@ -65,22 +56,18 @@ func Init(srcClient, dstClient *api.Client, cfg config.VaultClientConfig) error 
 
 	srcCluster.Client = srcClient
 
-	fmt.Print("Destination KV-V2 mount (e.g., 'secret'): ")
-	if scanner.Scan() {
-		dstCluster.MountPath = strings.TrimSpace(scanner.Text())
-	} else if scanner.Err() != nil {
-		return fmt.Errorf("failed to read destination mount: %w", scanner.Err())
+	mount, err = config.PromptRequired("Destination KV-V2 mount (e.g., 'secret'): ")
+	if err != nil {
+		return fmt.Errorf("failed to read destination mount: %w", err)
 	}
-	dstCluster.MountPath = trimSlashes(dstCluster.MountPath)
+	dstCluster.MountPath = trimSlashes(mount)
 	fmt.Printf("  Normalized mount: %s\n", dstCluster.MountPath)
 
-	fmt.Print("Destination KV-V2 base path (e.g., 'myapp-migrated/' or leave empty for root): ")
-	if scanner.Scan() {
-		dstCluster.BasePath = strings.TrimSpace(scanner.Text())
-	} else if scanner.Err() != nil {
-		return fmt.Errorf("failed to read destination base path: %w", scanner.Err())
+	basePath, err = config.Prompt("Destination KV-V2 base path (e.g., 'myapp-migrated/' or leave empty for root): ")
+	if err != nil {
+		return fmt.Errorf("failed to read destination base path: %w", err)
 	}
-	dstCluster.BasePath = trimSlashes(dstCluster.BasePath)
+	dstCluster.BasePath = trimSlashes(basePath)
 	if dstCluster.BasePath != "" {
 		fmt.Printf("  Normalized path: %s\n", dstCluster.BasePath)
 	} else {
@@ -151,7 +138,7 @@ func Init(srcClient, dstClient *api.Client, cfg config.VaultClientConfig) error 
 		logger.Info("DRY RUN MODE - No changes will be made to destination")
 	}
 
-	err := m.Run(context.Background(), Options{
+	err = m.Run(context.Background(), Options{
 		ContinueOnError: cfg.ContinueOnError,
 		DryRun:          cfg.DryRun,
 	})

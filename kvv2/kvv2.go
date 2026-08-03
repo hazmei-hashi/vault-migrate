@@ -214,7 +214,10 @@ func (m *Migrator) copyOneSecretWithState(ctx context.Context, srcKey, dstKey st
 	srcMaxVersion := getMaxVersion(srcMeta)
 
 	dstMeta, err := m.kv2ReadMetadata(ctx, m.Dst, dstKey)
-	destExists := (err == nil && dstMeta != nil)
+	destExists := err == nil
+	if err != nil && !isNotFound(err) {
+		return fmt.Errorf("read destination metadata: %w", err)
+	}
 
 	if destExists {
 		dstMaxVersion := getMaxVersion(dstMeta)
@@ -611,7 +614,12 @@ func (m *Migrator) kv2ReadMetadata(ctx context.Context, c KVV2Cluster, relKey st
 		return nil, err
 	}
 	if sec == nil || sec.Data == nil {
-		return nil, fmt.Errorf("empty metadata response for %q", path)
+		// Vault's Read() collapses a bare 404 (no warnings/data) into
+		// (nil, nil) rather than an error. Surface it as a "not found"
+		// so callers using isNotFound (e.g. destination-exists checks)
+		// treat a missing secret the same whether the API returned an
+		// explicit 404 error or this nil/nil shape.
+		return nil, fmt.Errorf("not found: empty metadata response for %q", path)
 	}
 
 	wrapped := map[string]any{"data": sec.Data}

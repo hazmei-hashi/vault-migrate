@@ -662,6 +662,29 @@ func TestInit_WithPromptInput_MigratesSecrets(t *testing.T) {
 	}
 }
 
+func TestInit_EmptyMount_Rejected(t *testing.T) {
+	src := newFakeVault(t)
+	dst := newFakeVault(t)
+
+	// A blank line at the mount prompt must be rejected (re-prompted) rather
+	// than silently accepted as an empty MountPath. Since only one line of
+	// input is provided and it's consumed by the re-prompt, Init should
+	// fail with EOF instead of proceeding with an empty mount.
+	useStdinInput(t, "\n")
+
+	err := Init(
+		src.newClient(t),
+		dst.newClient(t),
+		config.VaultClientConfig{
+			NoState:  true,
+			LogLevel: "error",
+		},
+	)
+	if err == nil {
+		t.Fatalf("expected Init to fail on empty mount input, got nil error")
+	}
+}
+
 func TestWalkAllKeys_WithNestedTree(t *testing.T) {
 	src := newFakeVault(t)
 	dst := newFakeVault(t)
