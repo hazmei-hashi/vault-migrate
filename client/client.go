@@ -134,7 +134,7 @@ func getClient(address string, token string, namespace string, skipVerify bool) 
 
 	lookup, err := client.Auth().Token().LookupSelf()
 	if err != nil {
-		log.Fatalf("Token lookup failed for %s", address)
+		log.Fatalf("Token lookup failed for %s (namespace %q): %v", address, namespace, err)
 	} else {
 		ttl, _ := lookup.TokenTTL()
 		log.Printf("Found initialized/unsealed cluster %s (Token TTL: %v)\n", health.ClusterID, ttl)

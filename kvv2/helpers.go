@@ -2,6 +2,7 @@ package kvv2
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 )
 
@@ -49,6 +50,9 @@ func joinRel(a, b string) string {
 func isNotFound(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, errMetadataNotFound) {
+		return true
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "permission denied") == false && // not 403

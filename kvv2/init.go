@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"vault-migrate/config"
 	"vault-migrate/state"
 
@@ -32,11 +33,32 @@ type Options struct {
 	DryRun          bool
 }
 
+// promptMount reads a KV v2 mount until it is non-empty AFTER slash
+// normalization. Validating before normalization lets "/" or "///" through as
+// "non-empty" input that normalizes to an empty mount, producing "/metadata/..."
+// requests that 404, get swallowed by isNotFound, and exit 0 as a "completed"
+// no-op migration - the same silent no-op this fix set out to kill.
+//
+// ponytail: strings.Trim locally, not trimSlashes - trimSlashes strips only one
+// slash per side (B16), so it would still pass "///" through as "/".
+func promptMount(label string) (string, error) {
+	for {
+		v, err := config.PromptRequired(label)
+		if err != nil {
+			return "", err
+		}
+		if mount := strings.Trim(v, "/"); mount != "" {
+			return mount, nil
+		}
+		fmt.Println("  mount cannot be only slashes")
+	}
+}
+
 func Init(srcClient, dstClient *api.Client, cfg config.VaultClientConfig) error {
 	var srcCluster KVV2Cluster
 	var dstCluster KVV2Cluster
 
-	mount, err := config.PromptRequired("Source KV-V2 mount (e.g., 'secret'): ")
+	mount, err := promptMount("Source KV-V2 mount (e.g., 'secret'): ")
 	if err != nil {
 		return fmt.Errorf("failed to read source mount: %w", err)
 	}
@@ -56,7 +78,7 @@ func Init(srcClient, dstClient *api.Client, cfg config.VaultClientConfig) error 
 
 	srcCluster.Client = srcClient
 
-	mount, err = config.PromptRequired("Destination KV-V2 mount (e.g., 'secret'): ")
+	mount, err = promptMount("Destination KV-V2 mount (e.g., 'secret'): ")
 	if err != nil {
 		return fmt.Errorf("failed to read destination mount: %w", err)
 	}

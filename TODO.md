@@ -78,6 +78,15 @@ Active backlog only. Obsolete historical notes removed.
   strips one leading/trailing `/` (`TrimPrefix`/`TrimSuffix`, not `Trim`), so
   a base path like `//app/` normalizes to `/app` instead of `app`. Out of
   scope this round per explicit instruction not to touch `helpers.go:30-35`.
+- [ ] B17: `isNotFound` substring matching — `kvv2/helpers.go`'s `isNotFound`
+  matches "404"/"not found" as substrings of the error message, so a genuine
+  500 whose *path* happens to contain "404" (e.g. key `app/error-404`) is
+  misread as not-found. PR #8 added `errMetadataNotFound` as a structural
+  sentinel for the nil/nil "empty metadata" case (`errors.Is`), but that only
+  hardens the one path that produces that sentinel — the substring matcher
+  underneath is untouched and still has this gap for every other caller of
+  `isNotFound`. Proper fix: `errors.As` on `*api.ResponseError` and check
+  `StatusCode == 404` instead of string-matching the message.
 
 ## Completed Snapshot (Trimmed)
 

@@ -2,6 +2,7 @@ package kvv2
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -91,6 +92,33 @@ func TestIsNotFound(t *testing.T) {
 				t.Errorf("isNotFound(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestIsNotFound_SentinelAndPathContaining404 covers two isNotFound paths.
+//
+//  1. errMetadataNotFound is matched structurally via errors.Is, independent
+//     of message text (Fix 4).
+//  2. A genuine 500 whose *path* happens to contain the substring "404" (e.g.
+//     key "app/error-404") is, honestly, still misread as not-found: the
+//     pre-existing substring match on "404" in helpers.go has no way to tell
+//     "status code 404" from "...error-404..." in a wrapped message. Fix 4
+//     only hardened the metadata-not-found sentinel, not the substring
+//     matcher itself - see TODO.md B17 for the errors.As(*api.ResponseError)
+//     fix that would close this gap.
+func TestIsNotFound_SentinelAndPathContaining404(t *testing.T) {
+	sentinelErr := fmt.Errorf("%w: empty metadata response for %q", errMetadataNotFound, "secret/metadata/app/x")
+	if !isNotFound(sentinelErr) {
+		t.Errorf("isNotFound(%v) = false, want true (errMetadataNotFound sentinel)", sentinelErr)
+	}
+
+	// Genuine 500, no "404" status anywhere - just a key path that contains
+	// the digits "404". Documents the known B17 gap: this IS misclassified
+	// as not-found today because of substring matching, not because of
+	// anything Fix 4 touched.
+	pathContaining404Err := errors.New("500 Internal Server Error: failed to read secret/metadata/app/error-404")
+	if got := isNotFound(pathContaining404Err); !got {
+		t.Errorf("isNotFound(%v) = %v, want true — B17: substring match on \"404\" in the path text still misreads this 500 as not-found; not fixed by Fix 4", pathContaining404Err, got)
 	}
 }
 

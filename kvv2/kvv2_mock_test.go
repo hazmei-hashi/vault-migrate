@@ -685,6 +685,92 @@ func TestInit_EmptyMount_Rejected(t *testing.T) {
 	}
 }
 
+// TestInit_SlashOnlyMount_Rejected proves that a mount value consisting only
+// of slashes is rejected (re-prompted) rather than accepted as non-empty and
+// silently normalized to an empty MountPath.
+//
+// Each input supplies exactly the 4 lines that TestInit_WithPromptInput_MigratesSecrets
+// uses for a *successful* run ("<mount>\n<basepath>\n<dst-mount>\n<dst-basepath>\n"),
+// just with a slash-only value standing in for the source mount. Before Fix
+// 1, PromptRequired validated pre-normalization, so e.g. "/" passed as
+// "non-empty" input, trimSlashes("/") -> "", and Init ran to completion with
+// err == nil (0 keys migrated, logged as "Migration completed") - the exact
+// silent no-op this fix set out to kill. Confirmed against pre-fix init.go:
+// these same 4-line inputs return a nil error there because the slash-only
+// value is accepted outright, leaving 3 spare lines to satisfy every
+// remaining prompt. Post-fix, promptMount's re-prompt loop consumes those
+// spare lines trying to find a real mount value, runs out of input, and
+// Init correctly fails with io.EOF instead.
+func TestInit_SlashOnlyMount_Rejected(t *testing.T) {
+	inputs := map[string]string{
+		"single slash": "/\n\nsecret\n\n",
+		"double slash": "//\n\nsecret\n\n",
+		"triple slash": "///\n\nsecret\n\n",
+		"spaced slash": " / \n\nsecret\n\n",
+	}
+
+	for name, input := range inputs {
+		t.Run(name, func(t *testing.T) {
+			src := newFakeVault(t)
+			dst := newFakeVault(t)
+
+			useStdinInput(t, input)
+
+			err := Init(
+				src.newClient(t),
+				dst.newClient(t),
+				config.VaultClientConfig{
+					NoState:  true,
+					LogLevel: "error",
+				},
+			)
+			if err == nil {
+				t.Fatalf("expected Init to fail on slash-only mount input %q, got nil error", input)
+			}
+		})
+	}
+}
+
+// TestPromptMount_NormalizesOrRejects exercises promptMount directly across
+// valid mounts (with/without stray slashes) and slash-only/blank input that
+// must re-prompt to EOF.
+func TestPromptMount_NormalizesOrRejects(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{name: "plain", input: "secret\n", want: "secret"},
+		{name: "leading and trailing slash", input: "/secret/\n", want: "secret"},
+		{name: "doubled leading and trailing slash", input: "//app//\n", want: "app"},
+		{name: "single slash re-prompts to EOF", input: "/\n", wantErr: true},
+		{name: "double slash re-prompts to EOF", input: "//\n", wantErr: true},
+		{name: "triple slash re-prompts to EOF", input: "///\n", wantErr: true},
+		{name: "spaced single slash re-prompts to EOF", input: " / \n", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			useStdinInput(t, tt.input)
+
+			got, err := promptMount("mount: ")
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("promptMount(%q) = %q, nil; want error", tt.input, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("promptMount(%q) unexpected error: %v", tt.input, err)
+			}
+			if got != tt.want {
+				t.Fatalf("promptMount(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestWalkAllKeys_WithNestedTree(t *testing.T) {
 	src := newFakeVault(t)
 	dst := newFakeVault(t)

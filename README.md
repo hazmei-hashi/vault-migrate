@@ -190,9 +190,9 @@ Any value not supplied via flag is prompted for, in this exact order (skipping e
 5. Destination Vault token (hidden input)
 6. Destination namespace (empty = root namespace)
 7. Skip TLS verification? (y/n)
-8. Source KV-V2 mount (required; re-prompts on empty input)
+8. Source KV-V2 mount (required; re-prompts on empty or slash-only input)
 9. Source KV-V2 base path (empty = root path, legal)
-10. Destination KV-V2 mount (required; re-prompts on empty input)
+10. Destination KV-V2 mount (required; re-prompts on empty or slash-only input)
 11. Destination KV-V2 base path (empty = root path, legal)
 
 Tokens are read via `term.ReadPassword` and require a real TTY (no echo, no

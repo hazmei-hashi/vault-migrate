@@ -2,6 +2,7 @@ package kvv2
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -9,6 +10,11 @@ import (
 	"time"
 	"vault-migrate/state"
 )
+
+// errMetadataNotFound sentinels Vault's nil/nil "empty metadata" shape (see
+// kv2ReadMetadata) so isNotFound can match it structurally instead of relying
+// solely on the "not found" substring baked into the wrapped message below.
+var errMetadataNotFound = errors.New("metadata not found")
 
 // walkAllKeys returns leaf secret keys relative to the mount
 func (m *Migrator) walkAllKeys(ctx context.Context, c KVV2Cluster, startPrefix string) ([]string, error) {
@@ -619,7 +625,7 @@ func (m *Migrator) kv2ReadMetadata(ctx context.Context, c KVV2Cluster, relKey st
 		// so callers using isNotFound (e.g. destination-exists checks)
 		// treat a missing secret the same whether the API returned an
 		// explicit 404 error or this nil/nil shape.
-		return nil, fmt.Errorf("not found: empty metadata response for %q", path)
+		return nil, fmt.Errorf("%w: empty metadata response for %q", errMetadataNotFound, path)
 	}
 
 	wrapped := map[string]any{"data": sec.Data}

@@ -25,8 +25,9 @@ var (
 )
 
 // Prompt prints label, reads one line from stdin, and returns it trimmed.
-// A line with no trailing newline (EOF) is still returned along with the
-// error so callers can decide whether to use partial input.
+// A final line with no trailing newline is returned with a nil error (partial
+// input accepted); the next call then reports io.EOF. An error is only
+// returned when nothing was read.
 func Prompt(label string) (string, error) {
 	if stdinSrc != os.Stdin {
 		stdinSrc = os.Stdin

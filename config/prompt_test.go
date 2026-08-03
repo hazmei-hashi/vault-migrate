@@ -1,6 +1,8 @@
 package config
 
 import (
+	"errors"
+	"io"
 	"os"
 	"testing"
 )
@@ -82,5 +84,25 @@ func TestPromptRequired_EOFOnAllEmpty(t *testing.T) {
 	_, err := PromptRequired("label: ")
 	if err == nil {
 		t.Fatalf("expected error on EOF, got nil")
+	}
+}
+
+// TestPrompt_NoTrailingNewline proves the doc comment on Prompt: a final
+// line with no trailing newline is returned with a nil error (partial input
+// accepted), and the next call on the now-exhausted stdin reports io.EOF.
+func TestPrompt_NoTrailingNewline(t *testing.T) {
+	useStdinInput(t, "secret")
+
+	v, err := Prompt("label: ")
+	if err != nil {
+		t.Fatalf("Prompt on no-trailing-newline input returned error: %v", err)
+	}
+	if v != "secret" {
+		t.Fatalf("v = %q, want %q", v, "secret")
+	}
+
+	_, err = Prompt("label: ")
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("second Prompt error = %v, want io.EOF", err)
 	}
 }
