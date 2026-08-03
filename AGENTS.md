@@ -24,6 +24,8 @@ Ensure there's sufficient testing for potential use case.
 
 DO NOT use directories outside of here. For temporary files, use .tmp/ directory in this repository.
 
+Fork: origin = hazmei-hashi/vault-migrate, upstream parent = czembower/vault-migrate. ALWAYS PR against origin main, NEVER upstream. `gh pr create` defaults base to upstream on forks — pass explicit: `gh pr create --repo hazmei-hashi/vault-migrate --base main`. Verify after: `isCrossRepository` must be `false`.
+
 You may use the directory /Users/hazmei/Documents/Obsidian/localvault/ to access the persistent Obsidian knowledge vault.
 
 ## Build & Run
