@@ -2,13 +2,21 @@
 
 Active backlog only. Obsolete historical notes removed.
 
-## Current Baseline (2026-08-03)
+## Current Baseline (2026-08-04)
 
-- 168 tests passing across 7 packages
-- Coverage: 67.5% total (`kvv2`: 76.6%, `config`: 100%, `state`: 91.1%, `cmd`: 33.3%)
+- 224 tests passing across 7 packages
+- Coverage: `client` 52.6%, `cmd` 35.3%, `config` 100.0%, `kvv2` 78.6%, `state` 85.5%
 - Phases 1-4 complete (unit, integration, mock harness, E2E)
 - Prompt desync bug fixed: shared `config.Prompt`/`PromptRequired` replaces
   `fmt.Scan`/`bufio.Scanner` mix in `client.go` and `kvv2/init.go`
+- Harness realism lesson: `kvv2/kvv2_mock_test.go` used to be more forgiving
+  than real Vault (bare errors instead of 404-with-data for soft-deleted/
+  destroyed version reads, no `max_versions` pruning enforcement on write),
+  so silent-failure bugs (B17's subtree skip, B18) were invisible by
+  construction and the pre-fix `kvv2` coverage number overstated confidence
+  in exactly the paths that mattered most. Mock fidelity is now partially
+  fixed (404-with-data + pruning enforced); treat harness realism as a
+  prerequisite before trusting future coverage deltas in this package.
 
 ## Active Items
 
@@ -35,58 +43,84 @@ Active backlog only. Obsolete historical notes removed.
   - `read_error`
   - `destroyed`
 - Improve logs/state to reflect exact reason paths
+- `oldest_version` from the KV v2 metadata response is not currently parsed
+  by `kv2MetadataResp` (`kvv2.go` ~106-118). Adding that one field lets a
+  missing version be classified as "pruned at source" (`v < oldest_version`)
+  vs. "never existed", which this taxonomy needs.
+- Sequence after B18: B18's fix (sentinel `errVersionDataUnavailable`) is
+  what produces the `source_version_unavailable` vs `read_error` distinction
+  as a side effect — doing P4 first would mean redoing the classification
+  once B18 lands.
 
 ### P5: Coverage Follow-up (Optional)
-- Improve bootstrap coverage (`main`, `client`, CLI wiring)
+- Improve bootstrap coverage (`main`, `cmd` CLI wiring)
 - Add targeted failure-path tests where defects appear
 
-### P6: Deferred Bugs (found during prompt-desync fix, out of scope this round)
+### P6: Deferred Bugs
 
-- [ ] B6: version-replay pruning data loss — `copyOneSecret`/`copySecretFull`/
-  `copyIncrementalVersions` (`kvv2.go:138-149, 307-319, 417-429`) write a
-  placeholder for any version missing from `meta.Data.Versions` but never
-  distinguish "never existed" from "pruned by `max_versions`/CAS on
-  destination write" — potential silent data loss on tight `max_versions`
-  destinations. Needs investigation before touching (explicitly out of
-  scope for the prompt-desync fix).
-- [ ] B8: configurable client timeout — `client/client.go:119` hardcodes
-  `client.SetClientTimeout(3 * time.Second)`. Large secrets/slow networks can
-  legitimately exceed 3s; make this a flag (`-clientTimeout`) with a sane
-  default.
-- [ ] B9: mount-existence preflight — `kvv2.Init` never checks that the
-  source/destination KV v2 mounts actually exist before walking/copying;
-  first real signal is an opaque error mid-migration. Add a preflight
-  `Sys().MountConfig`/`ListMounts` check with a clear error.
-- [ ] B10: dead srcAddr/dstAddr prompts — `client.BuildClients` still prompts
-  for `srcAddr`/`dstAddr` when unset via flag, but `cmd.validateConfig`
-  already fatals before `BuildClients` runs if either is empty, so those two
-  prompt branches are unreachable in practice via the `cmd` entrypoint.
-  Confirm intent (library-safe fallback vs dead code) and either document or
-  remove.
-- [ ] B11: non-atomic state write — `state.Save` (see `state/state.go`)
-  writes the state file directly, not via temp-file + rename; a process
-  kill mid-write can corrupt the state file used for incremental re-runs.
-- [ ] B13: `log.Fatal`/`log.Fatalf` in library funcs — `client/client.go`'s
-  `getClient` (health check, token lookup, `api.NewClient` failure) calls
-  `log.Fatal*` instead of returning an error, making `client` unusable as a
-  library and untestable without exiting the test process.
-- [ ] B14: unused `-maxRetries` flag — validated as `>= 0` in
-  `cmd.validateConfig` but no retry loop anywhere reads `c.MaxRetries`; either
-  wire it into `copyOneSecretWithState`/`copyOneSecret` retry behavior or
-  remove the flag. Documented as no-effect in README for now.
-- [ ] B16: `trimSlashes` single-slash strip — `kvv2/helpers.go:30-35` only
-  strips one leading/trailing `/` (`TrimPrefix`/`TrimSuffix`, not `Trim`), so
-  a base path like `//app/` normalizes to `/app` instead of `app`. Out of
-  scope this round per explicit instruction not to touch `helpers.go:30-35`.
-- [ ] B17: `isNotFound` substring matching — `kvv2/helpers.go`'s `isNotFound`
-  matches "404"/"not found" as substrings of the error message, so a genuine
-  500 whose *path* happens to contain "404" (e.g. key `app/error-404`) is
-  misread as not-found. PR #8 added `errMetadataNotFound` as a structural
-  sentinel for the nil/nil "empty metadata" case (`errors.Is`), but that only
-  hardens the one path that produces that sentinel — the substring matcher
-  underneath is untouched and still has this gap for every other caller of
-  `isNotFound`. Proper fix: `errors.As` on `*api.ResponseError` and check
-  `StatusCode == 404` instead of string-matching the message.
+- [ ] B6 (REFRAMED — was "version-replay pruning data loss"): NOT silent
+  data loss from placeholders. Placeholder triggers
+  (`copyOneSecret`/`copySecretFull`/`copyIncrementalVersions`, `kvv2.go`
+  lines 144-155 / 316-328 / 426-438 — prior line refs 138-149/307-319/
+  417-429 were stale) read only `srcMeta.Data.Versions` and never consult
+  destination state, so destination-side pruning cannot cause a placeholder
+  write. The latest value is never lost (written last, always survives
+  destination retention). Losing *old* versions is the destination honoring
+  its own configured `max_versions` — expected behavior, not a bug. The
+  original CAS claim is dropped entirely: `kv2WriteData` sends no `cas`
+  option, so a `cas_required` destination fails loudly on write, it does not
+  silently drop data. What actually remains as real gaps:
+  - (i) `DestVersionCount` in state is always asserted equal to the source
+    count (`maxV` / `endVersion` at write time, `kvv2.go:399,509`), never
+    measured from an actual destination read — the state file can lie about
+    how many versions really persisted if destination retention is lower.
+  - (ii) No warning is emitted when destination `max_versions` < source
+    version count, even though this silently caps history depth (see
+    README's new "destination retention governs history depth" note).
+  - (iii) `kv2WriteMetadataSettings` runs AFTER the version-write loop in
+    both `copySecretFull` (`kvv2.go:381`, loop is 321-379) and
+    `copyIncrementalVersions` (`kvv2.go:491`, loop is 431-489). Since the KV
+    v2 plugin retention is `max(per-secret, mount)`, a source `max_versions`
+    lower than the mount default can only ever *raise* effective retention
+    if applied after the writes — running it BEFORE the loop would let a
+    tight source `max_versions` actually prevent truncation during the copy
+    itself. Currently forfeited, easy win.
+  - (iv) The destructive recopy loop (destination retention < readable
+    source versions -> pruned-version read -> 404 -> treated as mismatch ->
+    delete+recopy -> re-pruned identically -> repeats every run) was the
+    most serious item under this bug and is FIXED this session — see
+    Completed Snapshot.
+- [ ] B18 (new, verified): 404-with-data bypasses the placeholder path.
+  Vault returns HTTP 404 WITH a `data` body
+  (`{"data":{"data":null,"metadata":{...}}}`, no `errors`) for a
+  soft-deleted version read. The Vault SDK reports that as SUCCESS
+  (`api/secret.go:364`: `DeepEqual` false -> errors-parsing branch skipped;
+  `api/logical.go:151`: `len(Data) > 0` -> returns `(secret, nil)`), so
+  `kv2ReadVersion` returns `(nil, nil)`. `copySecretFull`/
+  `copyIncrementalVersions` see `rerr == nil`, SKIP the `opts.Placeholder`
+  branch, and write `{"data": null}` to the destination — creating a real
+  destination version whose stored payload is null before it gets
+  soft-deleted to match. It also records an empty-string hash in state for
+  that version. Reachable ONLY for soft-deleted versions; destroyed versions
+  are already guarded by the `vm.Destroyed` pre-check earlier in the same
+  loop. No unrecoverable loss (the data was already unreadable at source),
+  but it bypasses the exact placeholder machinery built for this case.
+  Documented by a passing test,
+  `TestCopyOneSecret_BugA_DeletedVersionReadSucceedsWithEmptyPayload`
+  (`kvv2/kvv2_mock_test.go`), which asserts the CURRENT behavior and must be
+  updated when this is fixed.
+  - Proposed fix: return a sentinel `errVersionDataUnavailable` from
+    `kv2ReadVersion` when `out.Data.Data == nil`; preserve the "deleted"
+    state label in the placeholder branch (do not regress it to
+    `read_error`); make `verifyVersionHashes`/`verifyDestinationMatches`
+    skip that sentinel so it cannot trigger a delete+recopy the way the
+    pre-fix pruning bug used to.
+  - CRITICAL WARNING for whoever picks this up: do NOT "fix" this by
+    skipping reads whenever `DeletionTime != ""`. A future-dated
+    `deletion_time` set via `delete_version_after` is non-empty while the
+    version is STILL READABLE — skipping on that condition would cause
+    genuine loss of live, currently-accessible data. The fix must key off
+    the read actually returning nil data, not off the metadata field alone.
 
 ## Completed Snapshot (Trimmed)
 
@@ -102,6 +136,75 @@ Active backlog only. Obsolete historical notes removed.
   tokens) fixed
 - B7 (403/500/timeout on destination metadata read misread as "destination
   absent") fixed
-- B12 (`ConfigureTLS` error ignored) fixed
-- B15 (`%b` formatting of `time.Duration` TTL) fixed
-
+- B8 (client timeout hardcoded at 3s) fixed: `-clientTimeout` flag added,
+  default 60s, wired through `client.SetClientTimeout`
+- B9 (mount-existence preflight) — REDESIGNED, not implemented as originally
+  scoped. A `sys/mounts` preflight was rejected: it needs a read permission
+  the README's least-privilege token policy doesn't grant, it degraded to a
+  mere warning on 403 and every other error (making it toothless exactly
+  when it mattered), and its `options.version != "2"` hard-fail would have
+  broken working mounts that are actually fine — in-place
+  `vault kv enable-versioning` upgrades, Enterprise replicas, and older
+  Vault versions can all report nil/absent `options`. Replaced with a
+  0-keys guard in `Run`: if `walkAllKeys` finds zero secrets under the
+  configured source mount/base path, the migration now errors with
+  "refusing to report success" instead of exiting 0. Needs no new
+  permissions and catches a strict superset of B9's target cases (missing
+  mount, KV v1 mount, typo'd mount, typo'd base path) since all of them
+  resolve to zero keys.
+- B10 (dead `srcAddr`/`dstAddr` prompts in `client.BuildClients`) — doc-only
+  fix, no code change. Confirmed `cmd.validateConfig` fatals before
+  `BuildClients` runs if either address is empty, so those two prompt
+  branches are unreachable via the `cmd` entrypoint. Kept in code as a
+  library-safe fallback for callers that invoke `client.BuildClients`
+  directly without going through `validateConfig` first. README's Prompt
+  Order section corrected to state both addresses are flag-required and not
+  actually prompted from the CLI, with the remaining prompts renumbered.
+- B11 (non-atomic state write) fixed: `state.Save` now writes to a temp file
+  in the same directory as the target and `os.Rename`s into place. Atomic
+  against a killed process; NOT atomic against power loss (no `fsync`
+  before rename).
+- B13 (`log.Fatal*` in `client/`) fixed: all `log.Fatal*` calls in
+  `client/client.go`'s `getClient` replaced with returned errors; `cmd`
+  still fatals at the entrypoint, as intended. Unlocked
+  `client/client_test.go`, the first test file ever added for that package
+  (0% -> ~52.6% coverage), with regression locks for B5
+  (namespace-before-lookup), B8 (timeout honored), and B14 (`SetMaxRetries`
+  honored).
+- B14 (unused `-maxRetries` flag) fixed: wired into
+  `client.SetMaxRetries` + `retryablehttp.RateLimitLinearJitterBackoff`. It
+  was previously validated (`>= 0`) but never applied, leaving `RetryMax` at
+  0 — FEWER retries than the Vault SDK's own default of 2, with no
+  rate-limit-aware backoff on `429`/`503`. Retries live entirely at the
+  idempotent HTTP transport layer; deliberately no app-level per-secret
+  retry loop.
+- B16 (`trimSlashes` single-slash strip) fixed: now `strings.Trim` (was
+  `TrimPrefix`/`TrimSuffix`, which only stripped one leading/trailing slash
+  each), so `//app/` now normalizes to `app` instead of `/app`.
+- B17 (`isNotFound` substring matching) fixed: renamed `isMetadataNotFound`,
+  purely structural now (`errors.Is` on the `errMetadataNotFound` sentinel,
+  `errors.As` on `*api.ResponseError` checking `StatusCode == 404`). All
+  substring matching deleted. The substrings were causing SILENT DATA LOSS:
+  a KV v1 mount returns HTTP 400 "unsupported path", which used to match as
+  not-found. Bigger win under the same bug number: the `isNotFound` swallow
+  branch in `walkAllKeys`/`rec` (`kvv2.go`) was deleted outright — it
+  silently skipped an entire subtree on ANY list error and still let the
+  overall migration exit 0. `kv2List` already returns `(nil, nil)` for a
+  genuinely absent prefix, so that branch could never fire on a real
+  not-found; it only ever hid real errors (403, 400, 5xx, timeouts).
+- Destructive recopy loop fixed (filed under B6, see REFRAMED entry above
+  for the rest of B6's scope): `verifyDestinationMatches` now skips source
+  versions absent from destination metadata instead of treating them as a
+  mismatch. Previously, when destination retention was lower than the
+  number of readable source versions, comparison hit a pruned-away version,
+  got a bare 404, treated it as an error, triggered `kv2DeleteSecret` +
+  full recopy, which re-pruned to the identical state — repeating on EVERY
+  run. Non-idempotent and destructive, worst when local state was
+  absent/stale. Genuine mismatches are still detected and recopied.
+- Mock fidelity improved: `newFakeVault` now serves real Vault's
+  404-with-data shape for destroyed/soft-deleted version reads (rather than
+  a bare error) and enforces per-secret and mount-level `max_versions`
+  sliding-window pruning on write. The fake used to be more forgiving than
+  real Vault, which made pruning- and soft-delete-related bugs invisible by
+  construction.
+</content>

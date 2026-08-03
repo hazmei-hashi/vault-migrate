@@ -12,8 +12,8 @@ import (
 )
 
 // errMetadataNotFound sentinels Vault's nil/nil "empty metadata" shape (see
-// kv2ReadMetadata) so isNotFound can match it structurally instead of relying
-// solely on the "not found" substring baked into the wrapped message below.
+// kv2ReadMetadata) so isMetadataNotFound can match it structurally instead of
+// relying on message text.
 var errMetadataNotFound = errors.New("metadata not found")
 
 // walkAllKeys returns leaf secret keys relative to the mount
@@ -27,11 +27,16 @@ func (m *Migrator) walkAllKeys(ctx context.Context, c KVV2Cluster, startPrefix s
 	rec = func(prefix string) error {
 		keys, err := m.kv2List(ctx, c, prefix)
 		if err != nil {
-			// Treat missing prefix as empty.
-			if isNotFound(err) {
-				return nil
-			}
-			return err
+			// kv2List already returns (nil, nil) for a genuinely absent
+			// prefix (see its sec == nil / sec.Data == nil check below), so
+			// any error reaching here is real: 403 permission denied, 400
+			// "unsupported path" (e.g. a KV v1 mount), 5xx, or a timeout.
+			// Previously this branch treated ALL such errors as "missing
+			// subtree" and returned nil, which silently dropped every
+			// secret beneath prefix from the walk while the overall Run
+			// still exited 0 as a successful migration -- B17's highest-
+			// value fix.
+			return fmt.Errorf("list %q: %w", prefix, err)
 		}
 
 		for _, k := range keys {
@@ -221,7 +226,7 @@ func (m *Migrator) copyOneSecretWithState(ctx context.Context, srcKey, dstKey st
 
 	dstMeta, err := m.kv2ReadMetadata(ctx, m.Dst, dstKey)
 	destExists := err == nil
-	if err != nil && !isNotFound(err) {
+	if err != nil && !isMetadataNotFound(err) {
 		return fmt.Errorf("read destination metadata: %w", err)
 	}
 
@@ -565,9 +570,28 @@ func (m *Migrator) verifyVersionHashes(ctx context.Context, srcKey, dstKey strin
 func (m *Migrator) verifyDestinationMatches(ctx context.Context, srcKey, dstKey string, srcMeta *kv2MetadataResp) (bool, error) {
 	maxV := getMaxVersion(srcMeta)
 
+	dstMeta, err := m.kv2ReadMetadata(ctx, m.Dst, dstKey)
+	if err != nil {
+		return false, fmt.Errorf("read destination metadata: %w", err)
+	}
+
 	for v := 1; v <= maxV; v++ {
 		vm, ok := srcMeta.Data.Versions[strconv.Itoa(v)]
 		if !ok || vm.Destroyed {
+			continue
+		}
+
+		if _, destHas := dstMeta.Data.Versions[strconv.Itoa(v)]; !destHas {
+			// Version was pruned away by the destination's own retention
+			// window (max_versions) -- e.g. dest max_versions=3 but the
+			// source has 5 readable versions. This is NOT a genuine
+			// mismatch: the version simply no longer exists to compare.
+			// Erroring here (as this used to) sent copyOneSecretWithState
+			// down the delete+recopy path (kvv2.go verifyDestinationMatches
+			// caller), which immediately re-prunes back to the identical
+			// state -- a destructive, non-idempotent loop that repeats
+			// EVERY run. Skip the version instead of failing the
+			// comparison over it.
 			continue
 		}
 
@@ -622,9 +646,9 @@ func (m *Migrator) kv2ReadMetadata(ctx context.Context, c KVV2Cluster, relKey st
 	if sec == nil || sec.Data == nil {
 		// Vault's Read() collapses a bare 404 (no warnings/data) into
 		// (nil, nil) rather than an error. Surface it as a "not found"
-		// so callers using isNotFound (e.g. destination-exists checks)
-		// treat a missing secret the same whether the API returned an
-		// explicit 404 error or this nil/nil shape.
+		// so callers using isMetadataNotFound (e.g. destination-exists
+		// checks) treat a missing secret the same whether the API returned
+		// an explicit 404 error or this nil/nil shape.
 		return nil, fmt.Errorf("%w: empty metadata response for %q", errMetadataNotFound, path)
 	}
 

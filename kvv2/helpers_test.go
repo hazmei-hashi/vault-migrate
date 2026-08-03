@@ -3,7 +3,10 @@ package kvv2
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"testing"
+
+	"github.com/hashicorp/vault/api"
 )
 
 func TestTrimSlashes(t *testing.T) {
@@ -17,13 +20,13 @@ func TestTrimSlashes(t *testing.T) {
 		{"leading slash", "/path", "path"},
 		{"trailing slash", "path/", "path"},
 		{"both slashes", "/path/", "path"},
-		{"multiple leading", "///path", "//path"},
-		{"multiple trailing", "path///", "path//"},
-		{"both multiple", "///path///", "//path//"},
+		{"multiple leading", "///path", "path"},
+		{"multiple trailing", "path///", "path"},
+		{"both multiple", "///path///", "path"},
 		{"nested path", "/a/b/c/", "a/b/c"},
-		{"only slashes", "///", "/"},
+		{"only slashes", "///", ""},
 		{"with spaces", "  /path/  ", "path"},
-		{"spaces and slashes", "  ///path///  ", "//path//"},
+		{"spaces and slashes", "  ///path///  ", "path"},
 	}
 
 	for _, tt := range tests {
@@ -50,7 +53,7 @@ func TestJoinRel(t *testing.T) {
 		{"a with trailing slash", "a/", "b", "a/b"},
 		{"b with leading slash", "a", "/b", "a/b"},
 		{"both with slashes", "a/", "/b", "a/b"},
-		{"multiple slashes", "a///", "///b", "a/////b"},
+		{"multiple slashes", "a///", "///b", "a/b"},
 		{"nested paths", "a/b", "c/d", "a/b/c/d"},
 		{"with spaces", "  a  ", "  b  ", "a/b"},
 		{"complex nested", "/a/b/", "/c/d/", "a/b/c/d"},
@@ -66,59 +69,74 @@ func TestJoinRel(t *testing.T) {
 	}
 }
 
-func TestIsNotFound(t *testing.T) {
+// TestIsMetadataNotFound covers B17's structural rewrite of isNotFound
+// (renamed isMetadataNotFound): only errMetadataNotFound (via errors.Is) or
+// an *api.ResponseError with StatusCode 404 (via errors.As) count as
+// not-found. Plain errors that merely *mention* "404" or "not found" in
+// their message text -- what the old substring matcher keyed on -- must now
+// return false, since that substring matching is exactly what silently
+// swallowed real errors (403, 400, 500, timeouts) at call sites.
+func TestIsMetadataNotFound(t *testing.T) {
 	tests := []struct {
 		name string
 		err  error
 		want bool
 	}{
 		{"nil error", nil, false},
-		{"404 error", errors.New("status code 404"), true},
-		{"not found message", errors.New("secret not found"), true},
-		{"no handler for route", errors.New("no handler for route"), true},
-		{"unsupported path", errors.New("unsupported path"), true},
+		// Inverted from the old (buggy) substring-matching expectations:
+		// message text alone no longer implies not-found.
+		{"404 error (message text only, not a ResponseError)", errors.New("status code 404"), false},
+		{"not found message", errors.New("secret not found"), false},
+		{"no handler for route", errors.New("no handler for route"), false},
+		{"unsupported path", errors.New("unsupported path"), false},
+		{"404 in message", errors.New("API returned 404 not found"), false},
+		// Unaffected by the rewrite - never matched, still don't match.
 		{"permission denied", errors.New("permission denied"), false},
-		{"403 forbidden", errors.New("status code 403"), false},
+		{"403 forbidden (message text only)", errors.New("status code 403"), false},
 		{"500 error", errors.New("status code 500"), false},
 		{"connection error", errors.New("connection refused"), false},
 		{"generic error", errors.New("something went wrong"), false},
-		{"404 in message", errors.New("API returned 404 not found"), true},
+		// New structural coverage (B17): the only two ways a genuine
+		// not-found reaches this function.
+		{"errMetadataNotFound sentinel", errMetadataNotFound, true},
+		{"api.ResponseError 404", &api.ResponseError{StatusCode: http.StatusNotFound}, true},
+		{"api.ResponseError 403", &api.ResponseError{StatusCode: http.StatusForbidden}, false},
+		{"api.ResponseError 500", &api.ResponseError{StatusCode: http.StatusInternalServerError}, false},
+		{
+			"wrapped api.ResponseError 404",
+			fmt.Errorf("wrapped: %w", &api.ResponseError{StatusCode: http.StatusNotFound}),
+			true,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := isNotFound(tt.err)
+			got := isMetadataNotFound(tt.err)
 			if got != tt.want {
-				t.Errorf("isNotFound(%v) = %v, want %v", tt.err, got, tt.want)
+				t.Errorf("isMetadataNotFound(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
 	}
 }
 
-// TestIsNotFound_SentinelAndPathContaining404 covers two isNotFound paths.
-//
-//  1. errMetadataNotFound is matched structurally via errors.Is, independent
-//     of message text (Fix 4).
-//  2. A genuine 500 whose *path* happens to contain the substring "404" (e.g.
-//     key "app/error-404") is, honestly, still misread as not-found: the
-//     pre-existing substring match on "404" in helpers.go has no way to tell
-//     "status code 404" from "...error-404..." in a wrapped message. Fix 4
-//     only hardened the metadata-not-found sentinel, not the substring
-//     matcher itself - see TODO.md B17 for the errors.As(*api.ResponseError)
-//     fix that would close this gap.
-func TestIsNotFound_SentinelAndPathContaining404(t *testing.T) {
+// TestIsMetadataNotFound_Sentinel covers the errMetadataNotFound sentinel
+// matched structurally via errors.Is, independent of message text, and
+// closes out B17's previously-documented "path containing 404" gap: a
+// genuine 500 whose *path* happens to contain the substring "404" (e.g. key
+// "app/error-404") is no longer misread as not-found now that message-text
+// substring matching has been deleted entirely.
+func TestIsMetadataNotFound_Sentinel(t *testing.T) {
 	sentinelErr := fmt.Errorf("%w: empty metadata response for %q", errMetadataNotFound, "secret/metadata/app/x")
-	if !isNotFound(sentinelErr) {
-		t.Errorf("isNotFound(%v) = false, want true (errMetadataNotFound sentinel)", sentinelErr)
+	if !isMetadataNotFound(sentinelErr) {
+		t.Errorf("isMetadataNotFound(%v) = false, want true (errMetadataNotFound sentinel)", sentinelErr)
 	}
 
-	// Genuine 500, no "404" status anywhere - just a key path that contains
-	// the digits "404". Documents the known B17 gap: this IS misclassified
-	// as not-found today because of substring matching, not because of
-	// anything Fix 4 touched.
+	// Genuine 500, no ResponseError involved - just a key path that
+	// contains the digits "404". B17 fixed: this is correctly NOT
+	// classified as not-found now that substring matching is gone.
 	pathContaining404Err := errors.New("500 Internal Server Error: failed to read secret/metadata/app/error-404")
-	if got := isNotFound(pathContaining404Err); !got {
-		t.Errorf("isNotFound(%v) = %v, want true — B17: substring match on \"404\" in the path text still misreads this 500 as not-found; not fixed by Fix 4", pathContaining404Err, got)
+	if got := isMetadataNotFound(pathContaining404Err); got {
+		t.Errorf("isMetadataNotFound(%v) = %v, want false — B17 fixed the substring-match misread of a genuine 500 as not-found", pathContaining404Err, got)
 	}
 }
 
@@ -192,6 +210,13 @@ func TestDstKeyFor(t *testing.T) {
 			dstBase:   "new",
 			srcRelKey: "application/secret",
 			want:      "new/application/secret",
+		},
+		{
+			name:      "multi-slash base and key, empty dst base",
+			srcBase:   "//app//",
+			dstBase:   "",
+			srcRelKey: "//app//db//",
+			want:      "db",
 		},
 	}
 

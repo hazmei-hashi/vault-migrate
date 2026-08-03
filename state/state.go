@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -84,8 +85,29 @@ func (s *MigrationState) Save(path string) error {
 		return fmt.Errorf("marshal state: %w", err)
 	}
 
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		return fmt.Errorf("write state file: %w", err)
+	// ponytail: temp-file + rename guards against a killed process leaving a
+	// truncated/partial state file; it does not guard against power loss
+	// (no fsync). Add fsync before rename if that ceiling matters.
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".state-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp state file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write temp state file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp state file: %w", err)
+	}
+	if err := os.Chmod(tmpPath, 0600); err != nil {
+		return fmt.Errorf("chmod temp state file: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("rename temp state file: %w", err)
 	}
 
 	return nil

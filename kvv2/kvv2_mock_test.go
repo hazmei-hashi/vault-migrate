@@ -39,9 +39,29 @@ type fakeKVSecret struct {
 }
 
 type fakeVault struct {
-	mu      sync.Mutex
-	secrets map[string]*fakeKVSecret
-	server  *httptest.Server
+	mu sync.Mutex
+	// mountMaxVersions mirrors the KV v2 mount-level "max_versions" tunable
+	// (`vault secrets tune`). 0 means unset, same as a per-secret MaxVersions
+	// of 0.
+	mountMaxVersions int
+	// deleteSecretCalls counts kv2DeleteSecret calls against this fake, used
+	// by Task 4's idempotency test to assert a second migration run performs
+	// zero destination deletes.
+	deleteSecretCalls int
+	// forceListErrorStatus, when non-zero, makes every metadata LIST request
+	// fail with this HTTP status instead of returning real data. Used by
+	// Task 2's end-to-end proof that a genuine LIST error (403/500/etc.)
+	// propagates out of walkAllKeys as a non-nil error instead of being
+	// silently swallowed as "empty subtree".
+	forceListErrorStatus int
+	// forceListErrorMessage is the error string served alongside
+	// forceListErrorStatus. Lets tests reproduce specific real-Vault error
+	// texts (e.g. literally "unsupported path" for a KV v1 mount, or a path
+	// that happens to contain the digits "404") that the old substring-based
+	// isNotFound used to misclassify as not-found.
+	forceListErrorMessage string
+	secrets               map[string]*fakeKVSecret
+	server                *httptest.Server
 }
 
 func newFakeVault(t *testing.T) *fakeVault {
@@ -99,6 +119,38 @@ func cloneStringMap(in map[string]string) map[string]string {
 	return out
 }
 
+// defaultMaxVersions mirrors KV v2's built-in default retention window when
+// neither the mount nor the secret has max_versions configured.
+const defaultMaxVersions = 10
+
+// pruneVersions implements KV v2's sliding-window retention (Task 1b): on
+// every write, if the version count exceeds the effective max_versions, the
+// oldest versions are dropped from the metadata map entirely (not merely
+// soft-deleted -- gone, same as real Vault's storage GC for pruned versions).
+// Effective retention = max(per-secret MaxVersions, mount-level
+// mountMaxVersions), falling back to defaultMaxVersions when both are 0.
+// Caller must hold f.mu.
+func (f *fakeVault) pruneVersions(sec *fakeKVSecret) {
+	effective := sec.MaxVersions
+	if f.mountMaxVersions > effective {
+		effective = f.mountMaxVersions
+	}
+	if effective <= 0 {
+		effective = defaultMaxVersions
+	}
+
+	if len(sec.Versions) <= effective {
+		return
+	}
+
+	oldest := sec.CurrentVersion - effective
+	for v := range sec.Versions {
+		if v <= oldest {
+			delete(sec.Versions, v)
+		}
+	}
+}
+
 func (f *fakeVault) putVersion(key string, data map[string]any) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -106,6 +158,7 @@ func (f *fakeVault) putVersion(key string, data map[string]any) int {
 	sec := f.ensureSecret(key)
 	sec.CurrentVersion++
 	sec.Versions[sec.CurrentVersion] = &fakeKVVersion{Data: cloneMap(data)}
+	f.pruneVersions(sec)
 	return sec.CurrentVersion
 }
 
@@ -118,6 +171,38 @@ func (f *fakeVault) setMetadata(key string, casRequired bool, maxVersions int, d
 	sec.MaxVersions = maxVersions
 	sec.DeleteVersionAfter = deleteVersionAfter
 	sec.CustomMetadata = cloneStringMap(customMetadata)
+}
+
+// setMountMaxVersions sets the mount-level max_versions tunable used as a
+// fallback when a secret has no per-secret MaxVersions of its own (Task 1c).
+func (f *fakeVault) setMountMaxVersions(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.mountMaxVersions = n
+}
+
+// deleteCalls returns how many times kv2DeleteSecret (metadata DELETE) has
+// been issued against this fake, for Task 4's idempotency assertion.
+func (f *fakeVault) deleteCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.deleteSecretCalls
+}
+
+// setForceListError makes every subsequent metadata LIST request fail with
+// the given HTTP status and error message instead of returning real data,
+// for Task 2's end-to-end proof that walkAllKeys surfaces genuine LIST
+// errors instead of swallowing them. Passing status alone reproduces a
+// generic failure; a custom message lets a test reproduce a specific
+// real-Vault error string (e.g. a KV v1 mount's literal "unsupported path").
+func (f *fakeVault) setForceListError(status int, message string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.forceListErrorStatus = status
+	f.forceListErrorMessage = message
 }
 
 func (f *fakeVault) setVersionData(key string, version int, data map[string]any) {
@@ -281,6 +366,28 @@ func writeNotFound(w http.ResponseWriter) {
 	})
 }
 
+// writeNotFoundWithData serves real Vault's shape for a read against a
+// deleted/destroyed KV v2 version: HTTP 404, but WITH a "data" key (no
+// "errors" key) carrying nil data plus the version metadata. See
+// vault-plugin-secrets-kv path_data.go pathDataRead. This is the shape the
+// SDK's ParseRawResponseAndCloseBody (api/logical.go) treats as a 404 that
+// still has data/warnings, which api/secret.go's DeepEqual check then
+// reports as SUCCESS (secret, nil) rather than (nil, nil) -- unlike a bare
+// 404 for a version/secret that never existed at all.
+func writeNotFoundWithData(w http.ResponseWriter, version int, destroyed bool, deletionTime string) {
+	writeJSON(w, http.StatusNotFound, map[string]any{
+		"data": map[string]any{
+			"data": nil,
+			"metadata": map[string]any{
+				"version":       version,
+				"deletion_time": deletionTime,
+				"destroyed":     destroyed,
+			},
+		},
+		"warnings": nil,
+	})
+}
+
 func (f *fakeVault) handle(w http.ResponseWriter, r *http.Request) {
 	p := strings.TrimPrefix(r.URL.Path, "/v1/")
 	parts := strings.SplitN(p, "/", 3)
@@ -314,6 +421,16 @@ func (f *fakeVault) handleMetadata(w http.ResponseWriter, r *http.Request, relKe
 	defer f.mu.Unlock()
 
 	if isListRequest(r) {
+		if f.forceListErrorStatus != 0 {
+			msg := f.forceListErrorMessage
+			if msg == "" {
+				msg = "injected failure"
+			}
+			writeJSON(w, f.forceListErrorStatus, map[string]any{
+				"errors": []string{msg},
+			})
+			return
+		}
 		keys := f.listKeys(relKey)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"data": map[string]any{
@@ -326,6 +443,7 @@ func (f *fakeVault) handleMetadata(w http.ResponseWriter, r *http.Request, relKe
 	switch r.Method {
 	case http.MethodDelete:
 		delete(f.secrets, relKey)
+		f.deleteSecretCalls++
 		w.WriteHeader(http.StatusNoContent)
 		return
 	case http.MethodGet:
@@ -408,8 +526,18 @@ func (f *fakeVault) handleData(w http.ResponseWriter, r *http.Request, relKey st
 		}
 
 		v, ok := sec.Versions[version]
-		if !ok || v.Destroyed || v.DeletionTime != "" {
+		if !ok {
+			// Version never existed in metadata at all -> real Vault's
+			// storage layer returns nil,nil for a genuinely absent key,
+			// which the plugin turns into a bare 404 (no data key). See
+			// Task 1a.
 			writeNotFound(w)
+			return
+		}
+		if v.Destroyed || v.DeletionTime != "" {
+			// Version exists but has been soft-deleted or destroyed ->
+			// real Vault serves 404-with-data (see writeNotFoundWithData).
+			writeNotFoundWithData(w, version, v.Destroyed, v.DeletionTime)
 			return
 		}
 
@@ -435,6 +563,7 @@ func (f *fakeVault) handleData(w http.ResponseWriter, r *http.Request, relKey st
 		sec := f.ensureSecret(relKey)
 		sec.CurrentVersion++
 		sec.Versions[sec.CurrentVersion] = &fakeKVVersion{Data: cloneMap(payload)}
+		f.pruneVersions(sec)
 
 		writeJSON(w, http.StatusOK, map[string]any{
 			"data": map[string]any{"version": sec.CurrentVersion},
@@ -570,6 +699,69 @@ func TestRun_DryRun_DoesNotWriteDestination(t *testing.T) {
 
 	if _, err := m.kv2ReadMetadata(context.Background(), m.Dst, "app/dry"); err == nil {
 		t.Fatalf("destination metadata exists after dry-run; expected no writes")
+	}
+}
+
+// TestRun_ZeroKeys_RefusesToReportSuccess is B9: Run must error rather than
+// exit 0 whenever walkAllKeys returns zero keys, since 0 keys is
+// indistinguishable (from the SDK's point of view) from a missing mount, a
+// KV v1 mount, a typo'd mount, or a typo'd base path -- all of which would
+// otherwise silently report a "successful" migration that copied nothing.
+func TestRun_ZeroKeys_RefusesToReportSuccess(t *testing.T) {
+	tests := []struct {
+		name     string
+		basePath string
+	}{
+		{"genuinely empty mount", ""},
+		{"nonexistent mount subtree (typo'd base path)", "does/not/exist"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			src := newFakeVault(t)
+			dst := newFakeVault(t)
+
+			m := newTestMigrator(t, src, dst, false)
+			m.Src.BasePath = tt.basePath
+
+			err := m.Run(context.Background(), Options{})
+			if err == nil {
+				t.Fatalf("expected Run to fail on 0 keys, got nil error")
+			}
+			if !strings.Contains(err.Error(), "refusing to report success") {
+				t.Fatalf("unexpected Run error: %v", err)
+			}
+		})
+	}
+}
+
+// TestRun_ZeroKeys_NonexistentMount proves the same guard fires for a mount
+// that was never created at all (as opposed to an existing-but-empty one),
+// exercised through Init's full prompt-driven path so the failure is not a
+// silent success end to end.
+func TestRun_ZeroKeys_NonexistentMount(t *testing.T) {
+	src := newFakeVault(t)
+	dst := newFakeVault(t)
+
+	// dst gets a secret so a nonexistent-mount migration cannot be confused
+	// with a fully-empty test double; src intentionally has zero secrets.
+	dst.putVersion("unrelated/secret", map[string]any{"value": "noop"})
+
+	useStdinInput(t, "totally-nonexistent-mount\n\nsecret\n\n")
+
+	err := Init(
+		src.newClient(t),
+		dst.newClient(t),
+		config.VaultClientConfig{
+			NoState:  true,
+			LogLevel: "error",
+		},
+	)
+	if err == nil {
+		t.Fatalf("expected Init to fail for a nonexistent source mount, got nil error")
+	}
+	if !strings.Contains(err.Error(), "refusing to report success") {
+		t.Fatalf("unexpected Init error: %v", err)
 	}
 }
 
@@ -792,6 +984,49 @@ func TestWalkAllKeys_WithNestedTree(t *testing.T) {
 	}
 }
 
+// TestWalkAllKeys_PropagatesGenuineListErrors is B17's end-to-end proof: a
+// genuine LIST error (403 permission denied, 500, or 400 "unsupported path"
+// against a non-KV2 mount) must make walkAllKeys return a non-nil error,
+// NOT silently return an empty/partial key list while Run still exits 0.
+//
+// Before the fix, the isNotFound(err) branch inside walkAllKeys' rec()
+// treated every LIST error alike as "missing prefix" and returned nil,
+// discarding the whole subtree under prefix and any real cause. This test
+// was confirmed to FAIL against that pre-fix code (git stash + run), proving
+// it actually exercises the bug rather than trivially passing either way.
+func TestWalkAllKeys_PropagatesGenuineListErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		status  int
+		message string
+	}{
+		{"403 permission denied", http.StatusForbidden, ""},
+		{"500 internal server error", http.StatusInternalServerError, ""},
+		{"400 unsupported path (kv1 mount)", http.StatusBadRequest, "unsupported path"},
+		{"500 with path containing digits 404", http.StatusInternalServerError, "failed to read secret/metadata/app/error-404"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			src := newFakeVault(t)
+			dst := newFakeVault(t)
+
+			// A secret must exist so the first LIST call has something to
+			// fail on (an empty mount would return keys=[] before any error
+			// path is exercised).
+			src.putVersion("app/secret", map[string]any{"value": "v1"})
+			src.setForceListError(tt.status, tt.message)
+
+			m := newTestMigrator(t, src, dst, false)
+
+			keys, err := m.walkAllKeys(context.Background(), m.Src, "")
+			if err == nil {
+				t.Fatalf("walkAllKeys returned nil error for a %d LIST failure (msg=%q, keys=%v); genuine errors must propagate, not be swallowed as an empty subtree", tt.status, tt.message, keys)
+			}
+		})
+	}
+}
+
 func TestCopySecretFull_TracksStateAndMetadata(t *testing.T) {
 	src := newFakeVault(t)
 	dst := newFakeVault(t)
@@ -918,6 +1153,43 @@ func TestCopyOneSecret_HandlesVersionEdgeCases(t *testing.T) {
 	}
 	if v2["_reason"] != "missing_in_metadata" {
 		t.Fatalf("dst v2 _reason = %v, want missing_in_metadata", v2["_reason"])
+	}
+}
+
+// TestCopyOneSecret_BugA_DeletedVersionReadSucceedsWithEmptyPayload documents
+// a real, pre-existing behavior difference exposed by Task 1a's mock
+// fidelity fix (404-with-data for deleted/destroyed versions), filed as
+// "bug A" and explicitly OUT OF SCOPE for this change set.
+//
+// kv2ReadVersion (kvv2.go) treats any non-error, non-nil api.Secret as
+// success and returns sec.Data.Data. Real Vault's SDK reports a
+// 404-with-data response (deleted version) as SUCCESS -- api/secret.go's
+// DeepEqual check sees warnings/data present and skips the errors branch,
+// then api/logical.go's ParseRawResponseAndCloseBody returns (secret, nil)
+// because len(secret.Data) > 0. The "data" sub-key is nil (real Vault: the
+// payload itself is null), so kv2ReadVersion returns (nil-map, nil) instead
+// of an error -- copyOneSecret's `if rerr != nil { payload = opts.Placeholder }`
+// branch never fires for a *deleted* version's read, only for a genuinely
+// erroring read. The version still gets marked deleted afterward (correct),
+// but the payload written to the destination is an empty map, not the
+// configured placeholder. This test asserts the CURRENT (buggy) behavior so
+// a future fix is a deliberate, visible diff here rather than a silent
+// behavior change.
+func TestCopyOneSecret_BugA_DeletedVersionReadSucceedsWithEmptyPayload(t *testing.T) {
+	src := newFakeVault(t)
+	dst := newFakeVault(t)
+
+	src.putVersion("app/buga", map[string]any{"value": "v1"})
+	src.markVersionDeleted("app/buga", 1)
+
+	m := newTestMigrator(t, src, dst, false)
+
+	payload, err := m.kv2ReadVersion(context.Background(), m.Src, "app/buga", 1)
+	if err != nil {
+		t.Fatalf("bug A regressed: kv2ReadVersion now errors on a deleted version (%v); if intentionally fixed, update/remove this test and close bug A", err)
+	}
+	if len(payload) != 0 {
+		t.Fatalf("bug A regressed: kv2ReadVersion returned non-empty payload %v for a deleted version; if intentionally fixed, update/remove this test and close bug A", payload)
 	}
 }
 
@@ -1240,5 +1512,184 @@ func TestCopyOneSecretWithState_SkipsWhenHashesMatch(t *testing.T) {
 	}
 	if secretState.SourceVersionCount != 1 || secretState.DestVersionCount != 1 {
 		t.Fatalf("state version counts = (%d, %d), want (1, 1)", secretState.SourceVersionCount, secretState.DestVersionCount)
+	}
+}
+
+// TestFakeVault_PruneVersions exercises Task 1b: on write, the fake prunes
+// versions older than the sliding retention window, mirroring real Vault's
+// max_versions behavior (effective = max(per-secret, mount), default 10).
+func TestFakeVault_PruneVersions(t *testing.T) {
+	tests := []struct {
+		name             string
+		writes           int
+		perSecretMax     int
+		mountMax         int
+		wantOldestExists int // oldest version number expected to survive
+		wantCount        int // total versions expected to remain
+	}{
+		{
+			name:             "under default retention keeps everything",
+			writes:           5,
+			wantOldestExists: 1,
+			wantCount:        5,
+		},
+		{
+			name:             "exceeds default retention prunes to 10",
+			writes:           12,
+			wantOldestExists: 3,
+			wantCount:        10,
+		},
+		{
+			name:             "per-secret max_versions overrides default",
+			writes:           5,
+			perSecretMax:     3,
+			wantOldestExists: 3,
+			wantCount:        3,
+		},
+		{
+			name:             "mount max_versions used when higher than per-secret",
+			writes:           8,
+			perSecretMax:     2,
+			mountMax:         5,
+			wantOldestExists: 4,
+			wantCount:        5,
+		},
+		{
+			name:             "per-secret max_versions used when higher than mount",
+			writes:           8,
+			perSecretMax:     6,
+			mountMax:         2,
+			wantOldestExists: 3,
+			wantCount:        6,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFakeVault(t)
+			if tt.mountMax > 0 {
+				f.setMountMaxVersions(tt.mountMax)
+			}
+			if tt.perSecretMax > 0 {
+				f.setMetadata("app/prune", false, tt.perSecretMax, "", nil)
+			}
+
+			for i := 1; i <= tt.writes; i++ {
+				f.putVersion("app/prune", map[string]any{"n": i})
+			}
+
+			f.mu.Lock()
+			sec := f.secrets["app/prune"]
+			gotCount := len(sec.Versions)
+			_, oldestExists := sec.Versions[tt.wantOldestExists]
+			_, prunedExists := sec.Versions[tt.wantOldestExists-1]
+			f.mu.Unlock()
+
+			if gotCount != tt.wantCount {
+				t.Fatalf("remaining version count = %d, want %d", gotCount, tt.wantCount)
+			}
+			if !oldestExists {
+				t.Fatalf("expected version %d to survive pruning, it did not", tt.wantOldestExists)
+			}
+			if tt.wantOldestExists > 1 && prunedExists {
+				t.Fatalf("expected version %d to be pruned, but it still exists", tt.wantOldestExists-1)
+			}
+		})
+	}
+}
+
+// TestRun_PrunedDestination_DoesNotRecopyOnSecondRun is Task 4's idempotency
+// proof: destination retention (max_versions=3) is lower than the source's 5
+// readable versions, so versions 1-2 are pruned away from the destination's
+// own metadata immediately after the first migration writes them. A second
+// migration run must NOT delete-and-recopy the secret over those pruned
+// versions.
+//
+// The bug required verifyDestinationMatches to be reached with no cached
+// state to short-circuit it (existingState == nil or without version
+// hashes) -- exactly the "state absent/stale" case called out in the task:
+// a completed first run's hash cache lets a second run skip via
+// verifyVersionHashes without ever touching verifyDestinationMatches, which
+// would mask this bug. This test therefore uses a second, independent
+// Migrator (fresh, empty state) against the same destination backend for
+// "run 2", reproducing a state file that was lost/never loaded for this
+// secret while the destination itself still holds the previously-migrated
+// (now partially pruned) versions.
+//
+// Pre-fix, verifyDestinationMatches errored trying to read a pruned-away
+// destination version, which copyOneSecretWithState treated as "verification
+// failed" and answered by deleting the destination secret and doing a full
+// recopy -- which pruned right back to the same state, forever, every run.
+func TestRun_PrunedDestination_DoesNotRecopyOnSecondRun(t *testing.T) {
+	src := newFakeVault(t)
+	dst := newFakeVault(t)
+	dst.setMountMaxVersions(3)
+
+	src.putVersion("app/pruned", map[string]any{"value": "v1"})
+	src.putVersion("app/pruned", map[string]any{"value": "v2"})
+	src.putVersion("app/pruned", map[string]any{"value": "v3"})
+	src.putVersion("app/pruned", map[string]any{"value": "v4"})
+	src.putVersion("app/pruned", map[string]any{"value": "v5"})
+
+	m1 := newTestMigrator(t, src, dst, true)
+	if err := m1.Run(context.Background(), Options{}); err != nil {
+		t.Fatalf("first Run failed: %v", err)
+	}
+
+	dstMeta, err := m1.kv2ReadMetadata(context.Background(), m1.Dst, "app/pruned")
+	if err != nil {
+		t.Fatalf("read dst metadata after first run failed: %v", err)
+	}
+	if _, ok := dstMeta.Data.Versions["1"]; ok {
+		t.Fatalf("expected destination version 1 to be pruned away after first run, but it exists")
+	}
+	if _, ok := dstMeta.Data.Versions["3"]; !ok {
+		t.Fatalf("expected destination version 3 to survive pruning after first run")
+	}
+
+	deletesAfterFirstRun := dst.deleteCalls()
+
+	// Fresh Migrator, fresh (empty) state -> reproduces a state file that
+	// never recorded this secret, forcing copyOneSecretWithState into the
+	// verifyDestinationMatches path instead of the cached-hash skip.
+	m2 := newTestMigrator(t, src, dst, true)
+	if err := m2.Run(context.Background(), Options{}); err != nil {
+		t.Fatalf("second Run failed: %v", err)
+	}
+
+	if got := dst.deleteCalls(); got != deletesAfterFirstRun {
+		t.Fatalf("second run issued %d kv2DeleteSecret call(s) (delta), want 0 -- destructive recopy loop regressed", got-deletesAfterFirstRun)
+	}
+}
+
+// TestVerifyDestinationMatches_PrunedVersionSkipped is Task 4's unit-level
+// proof that a version absent from destination metadata (pruned by
+// max_versions) is skipped rather than failing verification, while a
+// version PRESENT on the destination with genuinely different content still
+// fails it.
+func TestVerifyDestinationMatches_PrunedVersionSkipped(t *testing.T) {
+	src := newFakeVault(t)
+	dst := newFakeVault(t)
+
+	src.putVersion("app/secret", map[string]any{"value": "v1"})
+	src.putVersion("app/secret", map[string]any{"value": "v2"})
+	dst.putVersion("app/secret", map[string]any{"value": "v1"})
+	dst.putVersion("app/secret", map[string]any{"value": "v2"})
+	// Version 1 is intentionally removed from the destination's metadata (as
+	// if pruned by max_versions), not present-but-different.
+	dst.removeVersion("app/secret", 1)
+
+	m := newTestMigrator(t, src, dst, false)
+	srcMeta, err := m.kv2ReadMetadata(context.Background(), m.Src, "app/secret")
+	if err != nil {
+		t.Fatalf("read src metadata failed: %v", err)
+	}
+
+	ok, err := m.verifyDestinationMatches(context.Background(), "app/secret", "app/secret", srcMeta)
+	if err != nil {
+		t.Fatalf("verifyDestinationMatches err = %v, want nil (pruned version must be skipped, not errored)", err)
+	}
+	if !ok {
+		t.Fatalf("verifyDestinationMatches = false, want true (only a genuinely absent version differs)")
 	}
 }

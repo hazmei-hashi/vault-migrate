@@ -102,7 +102,16 @@ Test conventions:
 - Table-driven tests (`tests := []struct{...}` + `t.Run` subtests) throughout.
 - `kvv2/kvv2_mock_test.go` provides `newFakeVault` — an `httptest.Server`-backed
   fake KV v2 backend used by all `kvv2` package unit tests instead of a real
-  Vault cluster.
+  Vault cluster. It models real Vault's 404-with-data response shape for
+  reads against deleted/destroyed versions, per-secret and mount-level
+  `max_versions` sliding-window pruning, and injectable LIST errors, plus a
+  `deleteCalls()` counter used to assert idempotency (no destination
+  delete+recopy) across repeated migration runs.
+- `client/client_test.go` provides a matching `httptest.Server`-backed fake for
+  `sys/health` and `auth/token/lookup-self`, covering every `getClient` error
+  path (unreachable address, health 5xx, uninitialized, sealed, lookup
+  failure) plus regression locks for namespace-before-lookup, max retries, and
+  client timeout.
 - Stdin-driven prompts (`Init`, `config.Prompt`/`PromptRequired`) are tested via
   a `useStdinInput(t, input)` helper that swaps `os.Stdin` for a pipe pre-loaded
   with the given input and restores it on cleanup.
@@ -181,19 +190,24 @@ Minimal command:
 
 ### Prompt Order
 
-Any value not supplied via flag is prompted for, in this exact order (skipping entries already set by flag):
+`-srcAddr` and `-dstAddr` are **not actually prompted** despite `client.BuildClients`
+containing prompt branches for both: `cmd.validateConfig` fatals before
+`BuildClients` ever runs if either is empty, so those two branches are dead
+code on the `cmd` entrypoint (kept as a library-safe fallback for callers
+that skip `validateConfig` — see `client/client.go`). Pass both as flags.
 
-1. Source Vault API address
-2. Source Vault token (hidden input)
-3. Source namespace (empty = root namespace)
-4. Destination Vault API address
-5. Destination Vault token (hidden input)
-6. Destination namespace (empty = root namespace)
-7. Skip TLS verification? (y/n)
-8. Source KV-V2 mount (required; re-prompts on empty or slash-only input)
-9. Source KV-V2 base path (empty = root path, legal)
-10. Destination KV-V2 mount (required; re-prompts on empty or slash-only input)
-11. Destination KV-V2 base path (empty = root path, legal)
+Any other value not supplied via flag is prompted for, in this exact order
+(skipping entries already set by flag):
+
+1. Source Vault token (hidden input)
+2. Source namespace (empty = root namespace)
+3. Destination Vault token (hidden input)
+4. Destination namespace (empty = root namespace)
+5. Skip TLS verification? (y/n)
+6. Source KV-V2 mount (required; re-prompts on empty or slash-only input)
+7. Source KV-V2 base path (empty = root path, legal)
+8. Destination KV-V2 mount (required; re-prompts on empty or slash-only input)
+9. Destination KV-V2 base path (empty = root path, legal)
 
 Tokens are read via `term.ReadPassword` and require a real TTY (no echo, no
 paste-safe fallback). In CI or any non-interactive environment, pass
@@ -222,7 +236,8 @@ The CLI supports these flags:
 | `-stateFile` | `.vault-migrate-state.json` | Path to migration state file |
 | `-noState` | `false` | Disable state tracking |
 | `-forceRecopy` | `false` | Re-copy when state indicates hashes already match |
-| `-maxRetries` | `3` | Validated as `>= 0` at startup, but currently has no effect on migration behavior (no retry loop reads it yet) |
+| `-maxRetries` | `3` | Validated as `>= 0` at startup; wired into the Vault API client's HTTP-level retry policy (`SetMaxRetries` + `retryablehttp.RateLimitLinearJitterBackoff`), so failed/idempotent requests are retried up to this many times, honoring a server's `Retry-After` header on `429`/`503` responses. No app-level per-secret retry loop exists — retries happen only at the HTTP transport layer, below `copyOneSecret` |
+| `-clientTimeout` | `60s` | Validated as `> 0` at startup; HTTP client timeout for Vault API requests (`SetClientTimeout`) |
 | `-continueOnError` | `false` | Continue migration after per-secret copy errors |
 | `-dryRun` | `false` | Show what would be copied without writing to the destination |
 
@@ -247,10 +262,12 @@ Per-secret behavior:
 2. Destination and source have same max version
 - If existing state has version hashes and `-forceRecopy=false`, tool can skip.
 - If no hash state, tool compares source/destination payload hashes.
-- On mismatch, destination secret metadata path is deleted, then full copy runs.
+- A source version already pruned from the destination's own metadata (by destination `max_versions`) is skipped during comparison, not treated as a mismatch — this avoids a destructive delete-and-recopy loop that would otherwise repeat on every run.
+- On genuine mismatch, destination secret metadata path is deleted, then full copy runs.
 
 3. Destination has fewer versions than source
 - Tool copies only missing tail versions (`dstMax+1..srcMax`).
+- Destination retention governs history depth: if destination `max_versions` is lower than the source version count, only the newest N versions persist there regardless of how many were copied — this is the destination's own KV v2 engine honoring its configured retention, not a migration bug.
 
 4. Destination has more versions than source
 - Secret marked failed.
@@ -275,7 +292,9 @@ Per-secret behavior:
 - Destroyed source payloads are unrecoverable; tool writes placeholder then marks destination version destroyed.
 - Token renewal is not handled; token TTL must exceed migration duration.
 - State file is single-writer; do not share one `-stateFile` across parallel migrations.
-- Vault client timeout is 3 seconds per request.
+- State file writes are atomic against a killed process (temp file in the same directory + `os.Rename`), but NOT against power loss — there is no `fsync` before the rename, so a hard crash at the wrong instant can still leave a lost (not corrupted) write on some filesystems.
+- Vault client timeout is configurable via `-clientTimeout` (default 60s per request).
+- A source mount/base path that resolves to zero secrets (missing mount, KV v1 mount, typo'd mount or base path) makes the migration fail rather than report success; the SDK cannot distinguish those cases from a genuinely empty mount.
 
 ## Security Notes
 

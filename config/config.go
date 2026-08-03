@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 )
 
 type VaultClientConfig struct {
@@ -20,6 +21,7 @@ type VaultClientConfig struct {
 	NoState         bool
 	ForceRecopy     bool
 	MaxRetries      int
+	ClientTimeout   time.Duration
 	ContinueOnError bool
 	DryRun          bool
 }
