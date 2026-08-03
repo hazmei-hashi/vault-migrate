@@ -104,9 +104,12 @@ Test conventions:
   fake KV v2 backend used by all `kvv2` package unit tests instead of a real
   Vault cluster. It models real Vault's 404-with-data response shape for
   reads against deleted/destroyed versions, per-secret and mount-level
-  `max_versions` sliding-window pruning, and injectable LIST errors, plus a
-  `deleteCalls()` counter used to assert idempotency (no destination
-  delete+recopy) across repeated migration runs.
+  `max_versions` sliding-window pruning, per-secret and mount-level
+  `cas_required` enforcement on data writes (rejecting a write with no
+  `options.cas` as `400 check-and-set parameter required for this call`),
+  and injectable LIST errors, plus a `deleteCalls()` counter used to assert
+  idempotency (no destination delete+recopy) across repeated migration
+  runs.
 - `client/client_test.go` provides a matching `httptest.Server`-backed fake for
   `sys/health` and `auth/token/lookup-self`, covering every `getClient` error
   path (unreachable address, health 5xx, uninitialized, sealed, lookup
@@ -252,6 +255,7 @@ State file stores:
 - Version hashes (SHA256)
 - Version state (`active`, `deleted`, `destroyed`, `missing`, `read_error`)
 - Metadata checksum
+- Source and destination version counts — the destination count is **measured** from an actual destination metadata read after copy, not assumed equal to the source count, so it stays accurate even when destination `max_versions` retention prunes below what was written. If that measurement read itself fails, the count falls back to the assumed (source) value and the failure is logged at debug — this bookkeeping never aborts the migration.
 - Summary counters
 
 Per-secret behavior:
@@ -274,6 +278,8 @@ Per-secret behavior:
 - Migration returns error for that secret.
 - With `-continueOnError`, migration continues to next secret.
 
+After any full or incremental copy (cases 1, 2, and 3), if the destination's measured version count ends up lower than the source count just copied, a `Logger.Warn` names the secret key and both the source and measured destination version counts. This is a warning only — the migration does not fail and does not retry: the latest value is written last and always survives destination retention, so only older history is affected.
+
 ### Legacy Mode (`-noState=true`)
 
 - Tool replays all source versions for every secret every run.
@@ -295,6 +301,7 @@ Per-secret behavior:
 - State file writes are atomic against a killed process (temp file in the same directory + `os.Rename`), but NOT against power loss — there is no `fsync` before the rename, so a hard crash at the wrong instant can still leave a lost (not corrupted) write on some filesystems.
 - Vault client timeout is configurable via `-clientTimeout` (default 60s per request).
 - A source mount/base path that resolves to zero secrets (missing mount, KV v1 mount, typo'd mount or base path) makes the migration fail rather than report success; the SDK cannot distinguish those cases from a genuinely empty mount.
+- **Migrating into a `cas_required` destination is not supported.** Every data write goes through `kv2WriteData`, which sends only `{"data": ...}` and never an `options.cas` value. If the destination secret's own metadata has `cas_required=true`, or the destination mount has its `cas_required` tunable set, Vault's KV v2 plugin rejects the very first version write with `400 check-and-set parameter required for this call`. The migration fails loudly for that secret (no state entry is recorded, and with `-continueOnError` the migration moves on to the next secret) — it does not silently drop data. There is currently no workaround; see the project TODO for design notes on a future fix.
 
 ## Security Notes
 

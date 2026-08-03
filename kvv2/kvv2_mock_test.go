@@ -1,6 +1,7 @@
 package kvv2
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -44,6 +45,11 @@ type fakeVault struct {
 	// (`vault secrets tune`). 0 means unset, same as a per-secret MaxVersions
 	// of 0.
 	mountMaxVersions int
+	// mountCASRequired mirrors the KV v2 mount-level "cas_required" tunable.
+	// Real Vault enforces check-and-set when EITHER the mount config OR the
+	// per-secret metadata has cas_required=true (path_data.go:278-288 in
+	// vault-plugin-secrets-kv@v0.26.2). See Task 1.
+	mountCASRequired bool
 	// deleteSecretCalls counts kv2DeleteSecret calls against this fake, used
 	// by Task 4's idempotency test to assert a second migration run performs
 	// zero destination deletes.
@@ -60,8 +66,15 @@ type fakeVault struct {
 	// that happens to contain the digits "404") that the old substring-based
 	// isNotFound used to misclassify as not-found.
 	forceListErrorMessage string
-	secrets               map[string]*fakeKVSecret
-	server                *httptest.Server
+	// forceMetadataReadErrorKey, when non-empty, makes a metadata GET (not
+	// LIST) for exactly this key fail with forceMetadataReadErrorStatus
+	// (default 500). Used to test that a destination metadata re-read for
+	// bookkeeping (measured DestVersionCount) degrades gracefully instead
+	// of aborting the migration.
+	forceMetadataReadErrorKey    string
+	forceMetadataReadErrorStatus int
+	secrets                      map[string]*fakeKVSecret
+	server                       *httptest.Server
 }
 
 func newFakeVault(t *testing.T) *fakeVault {
@@ -182,6 +195,17 @@ func (f *fakeVault) setMountMaxVersions(n int) {
 	f.mountMaxVersions = n
 }
 
+// setMountCASRequired sets the mount-level cas_required tunable
+// (`vault secrets tune -cas-required=true`). Real Vault enforces
+// check-and-set on every data write when this OR the per-secret
+// cas_required is true (Task 1).
+func (f *fakeVault) setMountCASRequired(v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.mountCASRequired = v
+}
+
 // deleteCalls returns how many times kv2DeleteSecret (metadata DELETE) has
 // been issued against this fake, for Task 4's idempotency assertion.
 func (f *fakeVault) deleteCalls() int {
@@ -203,6 +227,18 @@ func (f *fakeVault) setForceListError(status int, message string) {
 
 	f.forceListErrorStatus = status
 	f.forceListErrorMessage = message
+}
+
+// setForceMetadataReadError makes the next metadata GET for key fail with
+// status (defaults to 500 if 0), used to test that a destination metadata
+// re-read failure for bookkeeping purposes (measured DestVersionCount)
+// degrades gracefully instead of aborting the migration.
+func (f *fakeVault) setForceMetadataReadError(key string, status int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.forceMetadataReadErrorKey = key
+	f.forceMetadataReadErrorStatus = status
 }
 
 func (f *fakeVault) setVersionData(key string, version int, data map[string]any) {
@@ -447,6 +483,14 @@ func (f *fakeVault) handleMetadata(w http.ResponseWriter, r *http.Request, relKe
 		w.WriteHeader(http.StatusNoContent)
 		return
 	case http.MethodGet:
+		if f.forceMetadataReadErrorKey != "" && f.forceMetadataReadErrorKey == relKey {
+			status := f.forceMetadataReadErrorStatus
+			if status == 0 {
+				status = http.StatusInternalServerError
+			}
+			writeJSON(w, status, map[string]any{"errors": []string{"injected metadata read failure"}})
+			return
+		}
 		sec, ok := f.secrets[relKey]
 		if !ok {
 			writeNotFound(w)
@@ -559,6 +603,28 @@ func (f *fakeVault) handleData(w http.ResponseWriter, r *http.Request, relKey st
 			return
 		}
 
+		// Real Vault enforces check-and-set at write time when EITHER the
+		// mount-level or per-secret cas_required is true
+		// (vault-plugin-secrets-kv@v0.26.2 path_data.go:278-288): a write
+		// with no "options.cas" fails 400 with this exact error string. An
+		// existing secret keeps its recorded CASRequired; a brand-new key
+		// (not yet in f.secrets) can only be gated by the mount, since it
+		// has no per-secret metadata yet.
+		existing, hasExisting := f.secrets[relKey]
+		casRequired := f.mountCASRequired
+		if hasExisting && existing.CASRequired {
+			casRequired = true
+		}
+		if casRequired {
+			options, _ := body["options"].(map[string]any)
+			if _, hasCAS := options["cas"]; !hasCAS {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"errors": []string{"check-and-set parameter required for this call"},
+				})
+				return
+			}
+		}
+
 		payload, _ := body["data"].(map[string]any)
 		sec := f.ensureSecret(relKey)
 		sec.CurrentVersion++
@@ -660,6 +726,18 @@ func newTestMigrator(t *testing.T, src, dst *fakeVault, withState bool) *Migrato
 	}
 
 	return m
+}
+
+// newTestMigratorWithLogBuf is newTestMigrator plus a buffer capturing all
+// log output, for tests asserting on a specific Logger.Warn message (e.g.
+// destination retention truncation warnings).
+func newTestMigratorWithLogBuf(t *testing.T, src, dst *fakeVault, withState bool) (*Migrator, *bytes.Buffer) {
+	t.Helper()
+
+	m := newTestMigrator(t, src, dst, withState)
+	var buf bytes.Buffer
+	m.Logger = slog.New(slog.NewTextHandler(&buf, nil))
+	return m, &buf
 }
 
 func useStdinInput(t *testing.T, input string) {
@@ -1691,5 +1769,256 @@ func TestVerifyDestinationMatches_PrunedVersionSkipped(t *testing.T) {
 	}
 	if !ok {
 		t.Fatalf("verifyDestinationMatches = false, want true (only a genuinely absent version differs)")
+	}
+}
+
+// TestCopySecretFull_DestVersionCountMeasuredFromDestination is B6 item (i)'s
+// proof for the full-copy path: DestVersionCount in state must be measured
+// from an actual destination metadata read, not assumed equal to the source
+// count -- destination-side max_versions retention can prune below that
+// assumption. It also covers item (ii): a warning naming the secret and both
+// counts is emitted only when truncation actually occurred, and item (iii)'s
+// failure-graceful-degradation requirement: a destination metadata read
+// failure must not abort the migration, only fall back to the assumed count.
+func TestCopySecretFull_DestVersionCountMeasuredFromDestination(t *testing.T) {
+	tests := []struct {
+		name             string
+		dstMountMax      int  // 0 = unset (default retention, no pruning at 5 versions)
+		forceReadFailure bool // force the destination metadata re-read to fail
+		wantDestCount    int  // DestVersionCount expected in state
+		wantWarn         bool // a truncation warning must be emitted
+	}{
+		{
+			name:          "destination truncates history -> measured count and warning",
+			dstMountMax:   3,
+			wantDestCount: 3,
+			wantWarn:      true,
+		},
+		{
+			name:          "destination retains everything -> full count, no warning",
+			dstMountMax:   0,
+			wantDestCount: 5,
+			wantWarn:      false,
+		},
+		{
+			name:             "destination metadata read fails -> falls back to assumed, migration still succeeds",
+			dstMountMax:      3,
+			forceReadFailure: true,
+			wantDestCount:    5, // assumed (source count), since measurement failed
+			wantWarn:         false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			src := newFakeVault(t)
+			dst := newFakeVault(t)
+			if tt.dstMountMax > 0 {
+				dst.setMountMaxVersions(tt.dstMountMax)
+			}
+
+			for i := 1; i <= 5; i++ {
+				src.putVersion("app/secret", map[string]any{"n": i})
+			}
+
+			m, logBuf := newTestMigratorWithLogBuf(t, src, dst, true)
+
+			if tt.forceReadFailure {
+				dst.setForceMetadataReadError("app/secret", 0)
+			}
+
+			srcMeta, err := m.kv2ReadMetadata(context.Background(), m.Src, "app/secret")
+			if err != nil {
+				t.Fatalf("read src metadata failed: %v", err)
+			}
+
+			if err := m.copySecretFull(context.Background(), "app/secret", "app/secret", srcMeta, Options{
+				Placeholder: map[string]any{"_vault_migrate": "placeholder"},
+			}); err != nil {
+				t.Fatalf("copySecretFull failed (bookkeeping must never abort migration): %v", err)
+			}
+
+			sec := m.State.GetSecret("app/secret")
+			if sec == nil {
+				t.Fatalf("expected state entry for app/secret")
+			}
+			if sec.DestVersionCount != tt.wantDestCount {
+				t.Fatalf("DestVersionCount = %d, want %d", sec.DestVersionCount, tt.wantDestCount)
+			}
+
+			gotWarn := strings.Contains(logBuf.String(), "destination retention truncated")
+			if gotWarn != tt.wantWarn {
+				t.Fatalf("warning emitted = %v, want %v (log: %s)", gotWarn, tt.wantWarn, logBuf.String())
+			}
+			if tt.wantWarn {
+				log := logBuf.String()
+				if !strings.Contains(log, "app/secret") {
+					t.Fatalf("warning does not name the secret key: %s", log)
+				}
+				if !strings.Contains(log, "source_versions=5") {
+					t.Fatalf("warning does not name source version count: %s", log)
+				}
+				if !strings.Contains(log, "dest_versions=3") {
+					t.Fatalf("warning does not name dest version count: %s", log)
+				}
+			}
+		})
+	}
+}
+
+// TestCopyIncrementalVersions_DestVersionCountMeasuredFromDestination mirrors
+// TestCopySecretFull_DestVersionCountMeasuredFromDestination for the
+// incremental-copy path (copyIncrementalVersions), which has its own
+// separate (and separately buggy, pre-fix) DestVersionCount assignment.
+func TestCopyIncrementalVersions_DestVersionCountMeasuredFromDestination(t *testing.T) {
+	tests := []struct {
+		name             string
+		dstMountMax      int
+		forceReadFailure bool
+		wantDestCount    int
+		wantWarn         bool
+	}{
+		{
+			name:          "destination truncates history -> measured count and warning",
+			dstMountMax:   3,
+			wantDestCount: 3,
+			wantWarn:      true,
+		},
+		{
+			name:          "destination retains everything -> full count, no warning",
+			dstMountMax:   0,
+			wantDestCount: 5,
+			wantWarn:      false,
+		},
+		{
+			name:             "destination metadata read fails -> falls back to assumed, migration still succeeds",
+			dstMountMax:      3,
+			forceReadFailure: true,
+			wantDestCount:    5,
+			wantWarn:         false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			src := newFakeVault(t)
+			dst := newFakeVault(t)
+			if tt.dstMountMax > 0 {
+				dst.setMountMaxVersions(tt.dstMountMax)
+			}
+
+			for i := 1; i <= 5; i++ {
+				src.putVersion("app/secret", map[string]any{"n": i})
+			}
+
+			m, logBuf := newTestMigratorWithLogBuf(t, src, dst, true)
+
+			if tt.forceReadFailure {
+				dst.setForceMetadataReadError("app/secret", 0)
+			}
+
+			srcMeta, err := m.kv2ReadMetadata(context.Background(), m.Src, "app/secret")
+			if err != nil {
+				t.Fatalf("read src metadata failed: %v", err)
+			}
+
+			if err := m.copyIncrementalVersions(context.Background(), "app/secret", "app/secret", srcMeta, 1, 5, Options{
+				Placeholder: map[string]any{"_vault_migrate": "placeholder"},
+			}); err != nil {
+				t.Fatalf("copyIncrementalVersions failed (bookkeeping must never abort migration): %v", err)
+			}
+
+			sec := m.State.GetSecret("app/secret")
+			if sec == nil {
+				t.Fatalf("expected state entry for app/secret")
+			}
+			if sec.DestVersionCount != tt.wantDestCount {
+				t.Fatalf("DestVersionCount = %d, want %d", sec.DestVersionCount, tt.wantDestCount)
+			}
+
+			gotWarn := strings.Contains(logBuf.String(), "destination retention truncated")
+			if gotWarn != tt.wantWarn {
+				t.Fatalf("warning emitted = %v, want %v (log: %s)", gotWarn, tt.wantWarn, logBuf.String())
+			}
+			if tt.wantWarn {
+				log := logBuf.String()
+				if !strings.Contains(log, "app/secret") {
+					t.Fatalf("warning does not name the secret key: %s", log)
+				}
+				if !strings.Contains(log, "source_versions=5") {
+					t.Fatalf("warning does not name source version count: %s", log)
+				}
+				if !strings.Contains(log, "dest_versions=3") {
+					t.Fatalf("warning does not name dest version count: %s", log)
+				}
+			}
+		})
+	}
+}
+
+// TestCopySecretFull_CASRequiredDestination_FailsLoudly is Task 1's boundary
+// lock. kv2WriteData (kvv2.go ~720-730) sends only {"data": ...} -- it never
+// sends "options.cas" on any version write. Real Vault's KV v2 plugin
+// rejects such a write with 400 "check-and-set parameter required for this
+// call" whenever check-and-set is required, either by the destination
+// secret's own per-secret cas_required OR by the destination mount's
+// cas_required tunable (vault-plugin-secrets-kv@v0.26.2 path_data.go:
+// 278-288). This test pre-configures the DESTINATION with cas_required=true
+// (as an operator independently tuning their own destination would) and
+// asserts copySecretFull fails on the very first version write instead of
+// silently succeeding -- documenting real product behavior: migrating INTO
+// a cas_required destination is not supported today. See TODO.md B19.
+func TestCopySecretFull_CASRequiredDestination_FailsLoudly(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(dst *fakeVault)
+	}{
+		{
+			name: "per-secret cas_required on destination",
+			setup: func(dst *fakeVault) {
+				dst.setMetadata("app/secret", true, 0, "", nil)
+			},
+		},
+		{
+			name: "mount-level cas_required on destination",
+			setup: func(dst *fakeVault) {
+				dst.setMountCASRequired(true)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			src := newFakeVault(t)
+			dst := newFakeVault(t)
+
+			src.putVersion("app/secret", map[string]any{"value": "v1"})
+			tt.setup(dst)
+
+			m := newTestMigrator(t, src, dst, true)
+
+			srcMeta, err := m.kv2ReadMetadata(context.Background(), m.Src, "app/secret")
+			if err != nil {
+				t.Fatalf("read src metadata failed: %v", err)
+			}
+
+			err = m.copySecretFull(context.Background(), "app/secret", "app/secret", srcMeta, Options{
+				Placeholder: map[string]any{"_vault_migrate": "placeholder"},
+			})
+			if err == nil {
+				t.Fatalf("copySecretFull returned nil error against a cas_required destination; " +
+					"kv2WriteData never sends options.cas, so this must fail loudly, not silently succeed")
+			}
+			if !strings.Contains(err.Error(), "check-and-set parameter required") {
+				t.Fatalf("error = %q, want it to contain real Vault's check-and-set error text", err.Error())
+			}
+
+			// No state entry should be recorded for a secret that failed to
+			// migrate -- copySecretFull must return before reaching the
+			// state.UpdateSecret call.
+			if sec := m.State.GetSecret("app/secret"); sec != nil {
+				t.Fatalf("expected no state entry for a secret whose copy failed, got %+v", sec)
+			}
+		})
 	}
 }

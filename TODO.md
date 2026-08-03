@@ -4,19 +4,20 @@ Active backlog only. Obsolete historical notes removed.
 
 ## Current Baseline (2026-08-04)
 
-- 224 tests passing across 7 packages
-- Coverage: `client` 52.6%, `cmd` 35.3%, `config` 100.0%, `kvv2` 78.6%, `state` 85.5%
+- 235 tests passing across 7 packages
+- Coverage: `client` 52.6%, `cmd` 35.3%, `config` 100.0%, `kvv2` 79.4%, `state` 85.5%
 - Phases 1-4 complete (unit, integration, mock harness, E2E)
 - Prompt desync bug fixed: shared `config.Prompt`/`PromptRequired` replaces
   `fmt.Scan`/`bufio.Scanner` mix in `client.go` and `kvv2/init.go`
 - Harness realism lesson: `kvv2/kvv2_mock_test.go` used to be more forgiving
   than real Vault (bare errors instead of 404-with-data for soft-deleted/
-  destroyed version reads, no `max_versions` pruning enforcement on write),
-  so silent-failure bugs (B17's subtree skip, B18) were invisible by
-  construction and the pre-fix `kvv2` coverage number overstated confidence
-  in exactly the paths that mattered most. Mock fidelity is now partially
-  fixed (404-with-data + pruning enforced); treat harness realism as a
-  prerequisite before trusting future coverage deltas in this package.
+  destroyed version reads, no `max_versions` pruning enforcement on write, no
+  `cas_required` enforcement on data writes), so silent-failure bugs (B17's
+  subtree skip, B18, B19) were invisible by construction and the pre-fix
+  `kvv2` coverage number overstated confidence in exactly the paths that
+  mattered most. Mock fidelity is now fixed for 404-with-data, pruning, AND
+  check-and-set enforcement (mount- and secret-level); treat harness realism
+  as a prerequisite before trusting future coverage deltas in this package.
 
 ## Active Items
 
@@ -58,7 +59,7 @@ Active backlog only. Obsolete historical notes removed.
 
 ### P6: Deferred Bugs
 
-- [ ] B6 (REFRAMED — was "version-replay pruning data loss"): NOT silent
+- [x] B6 (REFRAMED — was "version-replay pruning data loss"): NOT silent
   data loss from placeholders. Placeholder triggers
   (`copyOneSecret`/`copySecretFull`/`copyIncrementalVersions`, `kvv2.go`
   lines 144-155 / 316-328 / 426-438 — prior line refs 138-149/307-319/
@@ -70,21 +71,69 @@ Active backlog only. Obsolete historical notes removed.
   original CAS claim is dropped entirely: `kv2WriteData` sends no `cas`
   option, so a `cas_required` destination fails loudly on write, it does not
   silently drop data. What actually remains as real gaps:
-  - (i) `DestVersionCount` in state is always asserted equal to the source
-    count (`maxV` / `endVersion` at write time, `kvv2.go:399,509`), never
-    measured from an actual destination read — the state file can lie about
-    how many versions really persisted if destination retention is lower.
-  - (ii) No warning is emitted when destination `max_versions` < source
-    version count, even though this silently caps history depth (see
-    README's new "destination retention governs history depth" note).
-  - (iii) `kv2WriteMetadataSettings` runs AFTER the version-write loop in
-    both `copySecretFull` (`kvv2.go:381`, loop is 321-379) and
-    `copyIncrementalVersions` (`kvv2.go:491`, loop is 431-489). Since the KV
-    v2 plugin retention is `max(per-secret, mount)`, a source `max_versions`
-    lower than the mount default can only ever *raise* effective retention
-    if applied after the writes — running it BEFORE the loop would let a
-    tight source `max_versions` actually prevent truncation during the copy
-    itself. Currently forfeited, easy win.
+  - [x] (i) `DestVersionCount` in state is now measured from an actual
+    destination metadata read (`measureDestVersionCount`, `kvv2.go`) after
+    both `copySecretFull` and `copyIncrementalVersions` write, instead of
+    always asserted equal to the source count. A measurement read failure
+    falls back to the assumed value and logs at debug — bookkeeping never
+    aborts the migration. Covered by
+    `TestCopySecretFull_DestVersionCountMeasuredFromDestination` and
+    `TestCopyIncrementalVersions_DestVersionCountMeasuredFromDestination`.
+  - [x] (ii) `warnDestTruncated` (`kvv2.go`) now emits a `Logger.Warn`
+    naming the secret key, source version count, and measured destination
+    version count whenever destination `max_versions` truncated history.
+    Warning only — never fails, never retries (latest value always
+    survives, written last). Covered by the same two tests as (i).
+  - [x] (iii) REJECTED — reordering `kv2WriteMetadataSettings` to run
+    BEFORE the version-write loop in `copySecretFull` (`kvv2.go:381`, loop
+    321-379) and `copyIncrementalVersions` (`kvv2.go:491`, loop 431-489).
+    Do NOT retry this. Rationale:
+    - The retention premise WAS correct and stays verified:
+      `vault-plugin-secrets-kv@v0.26.2/path_data.go:750-756` uses
+      `max(k.MaxVersions, configMaxVersions)`, so per-secret `max_versions`
+      can only RAISE effective retention, never lower it — applying it
+      before the loop would have been a legitimate easy win in isolation.
+    - REJECTED because the metadata payload is not just `max_versions`.
+      `kv2WriteMetadataSettings` (`kvv2.go:764-768`) sends `cas_required`
+      UNCONDITIONALLY from source metadata, and `kv2WriteData`
+      (`kvv2.go:720-730`) never sends `options.cas`. Moving the metadata
+      write before the loop would set `cas_required=true` on the
+      destination up front whenever the SOURCE secret has it set, then
+      EVERY subsequent version write in that same loop 400s
+      ("check-and-set parameter required for this call",
+      `path_data.go:278-288`) — total migration failure on exactly the
+      secrets operators guarded hardest. Task 1 in this session proved this
+      failure mode is real (see B19): it currently happens on the
+      DESTINATION side (operator tunes destination `cas_required`), and
+      reordering would additionally trigger it from the SOURCE side any
+      time source metadata carries `cas_required=true`, which is strictly
+      worse.
+    - Second reason: the payload also carries `delete_version_after`,
+      computed as the minimum non-zero of mount and per-secret and applied
+      AT WRITE TIME (`delete_version_after.go:16-28`,
+      `path_data.go:398-406`). Reordering stamps every replayed version
+      with `write_time + source_dva`, so a source `dva=24h` on years-old
+      history would make the entire migrated corpus self-delete a day
+      after cutover.
+    - Third reason (policy): silently RAISING an operator's destination
+      retention config exceeds this tool's mandate. The destination
+      honoring its own tuned `max_versions` is correct-by-policy, and B6
+      (i)/(ii) this session now measure and warn about it instead of lying
+      in state. The warning IS the right answer, not a reorder.
+    - Verified NON-issue, recorded so it isn't re-litigated: source/
+      destination version-number ALIGNMENT survives a reorder fine —
+      `AddVersion` increments monotonically and prunes by numeric window
+      without renumbering, and delete/destroy fire immediately after each
+      write when the version is newest-and-present. Alignment was never the
+      blocker; `cas_required`/`delete_version_after` ordering was.
+    - Salvage path for a future session, if this is ever revisited: split
+      the payload rather than reorder it whole — send ONLY
+      `{"max_versions": ...}` before the loop (the sole field that is
+      monotonic-upward by plugin design and harmless to already-written
+      versions), send `cas_required`/`delete_version_after`/
+      `custom_metadata` after the loop as today, and gate the early
+      `max_versions`-only write behind an explicit opt-in flag with loud
+      logging so it is never silent-by-default.
   - (iv) The destructive recopy loop (destination retention < readable
     source versions -> pruned-version read -> 404 -> treated as mismatch ->
     delete+recopy -> re-pruned identically -> repeats every run) was the
@@ -121,6 +170,37 @@ Active backlog only. Obsolete historical notes removed.
     version is STILL READABLE — skipping on that condition would cause
     genuine loss of live, currently-accessible data. The fix must key off
     the read actually returning nil data, not off the metadata field alone.
+- [ ] B19 (new, verified this session): migrating INTO a `cas_required`
+  destination fails completely, loudly, on the very first version write.
+  `kv2WriteData` (`kvv2.go:720-730`) sends only `{"data": ...}` — it never
+  sends `options.cas` on any write, for any secret, ever. Real Vault's KV v2
+  plugin requires check-and-set on every data write when EITHER the
+  destination mount's `cas_required` tunable OR the destination secret's
+  own per-secret `cas_required` is true
+  (`vault-plugin-secrets-kv@v0.26.2/path_data.go:278-288`); a write with no
+  `options.cas` gets a 400 "check-and-set parameter required for this
+  call". This is reachable purely from the DESTINATION side — an operator
+  who independently tunes `cas_required=true` on their destination mount or
+  pre-creates the destination secret with it set (for their own unrelated
+  reasons) makes every subsequent migration into that path/mount fail on
+  version 1, regardless of what the source secret's own `cas_required` is.
+  Not silent — the write error propagates up through
+  `copySecretFull`/`copyIncrementalVersions`/`copyOneSecret` as a returned
+  `error`, and no state entry is recorded for that secret. But it is a hard
+  migration blocker with no workaround today. Exposed by hardening the mock
+  (Task 1, this session — `kvv2/kvv2_mock_test.go`'s `handleData` POST/PUT
+  now enforces the same check real Vault does, where it previously stored
+  `cas_required` but never checked it) and locked by
+  `TestCopySecretFull_CASRequiredDestination_FailsLoudly`, which covers
+  both the per-secret and mount-level trigger. NOT fixed this session per
+  explicit scope (documenting only). Two possible fixes for a future
+  session, not evaluated in depth here: (a) read current version number
+  from a destination metadata GET immediately before each write and pass it
+  as `options.cas`, accepting the extra round trip per version; or (b) skip
+  a preflight destination read and simply attempt cas=0 (create-only) on
+  version 1, escalating to a real version number if the destination secret
+  already exists non-empty. Either needs its own design pass; do not
+  implement ad hoc alongside other changes.
 
 ## Completed Snapshot (Trimmed)
 
@@ -203,8 +283,12 @@ Active backlog only. Obsolete historical notes removed.
   absent/stale. Genuine mismatches are still detected and recopied.
 - Mock fidelity improved: `newFakeVault` now serves real Vault's
   404-with-data shape for destroyed/soft-deleted version reads (rather than
-  a bare error) and enforces per-secret and mount-level `max_versions`
-  sliding-window pruning on write. The fake used to be more forgiving than
-  real Vault, which made pruning- and soft-delete-related bugs invisible by
-  construction.
+  a bare error), enforces per-secret and mount-level `max_versions`
+  sliding-window pruning on write, and enforces per-secret and mount-level
+  `cas_required` on data writes (rejecting a write with no `options.cas` as
+  400 "check-and-set parameter required for this call", matching
+  `path_data.go:278-288`). The fake used to be more forgiving than real
+  Vault in all three ways, which made pruning-, soft-delete-, and
+  CAS-related bugs invisible by construction; the CAS gap specifically hid
+  B19 (see Active Items) until closed this session.
 </content>

@@ -393,10 +393,13 @@ func (m *Migrator) copySecretFull(ctx context.Context, srcKey, dstKey string, sr
 	}
 
 	if m.State != nil {
+		destCount := m.measureDestVersionCount(ctx, dstKey, maxV)
+		m.warnDestTruncated(srcKey, maxV, destCount)
+
 		secretState := &state.Secret{
 			Status:             "completed",
 			SourceVersionCount: maxV,
-			DestVersionCount:   maxV,
+			DestVersionCount:   destCount,
 			VersionHashes:      versionHashes,
 			VersionStates:      versionStates,
 			MetadataChecksum:   metaChecksum,
@@ -503,10 +506,13 @@ func (m *Migrator) copyIncrementalVersions(ctx context.Context, srcKey, dstKey s
 	}
 
 	if m.State != nil {
+		destCount := m.measureDestVersionCount(ctx, dstKey, endVersion)
+		m.warnDestTruncated(srcKey, endVersion, destCount)
+
 		secretState := &state.Secret{
 			Status:             "completed",
 			SourceVersionCount: endVersion,
-			DestVersionCount:   endVersion,
+			DestVersionCount:   destCount,
 			VersionHashes:      versionHashes,
 			VersionStates:      versionStates,
 			MetadataChecksum:   metaChecksum,
@@ -529,6 +535,32 @@ func getMaxVersion(meta *kv2MetadataResp) int {
 		}
 	}
 	return maxV
+}
+
+// measureDestVersionCount reads back the destination's actual metadata to
+// count versions really persisted there, since destination-side
+// max_versions retention can silently prune below the count assumed at
+// write time. Bookkeeping only: a read failure must never abort the
+// migration, so it logs at debug and falls back to assumed.
+func (m *Migrator) measureDestVersionCount(ctx context.Context, dstKey string, assumed int) int {
+	dstMeta, err := m.kv2ReadMetadata(ctx, m.Dst, dstKey)
+	if err != nil {
+		m.Logger.Debug("measure destination version count failed, using assumed value",
+			"secret", dstKey, "assumed", assumed, "err", err)
+		return assumed
+	}
+	return len(dstMeta.Data.Versions)
+}
+
+// warnDestTruncated logs when destination retention kept fewer versions
+// than the source had. This is the destination honoring its own configured
+// max_versions -- expected, not an error -- so it only warns; it never
+// fails or retries.
+func (m *Migrator) warnDestTruncated(srcKey string, srcCount, destCount int) {
+	if destCount < srcCount {
+		m.Logger.Warn("destination retention truncated version history",
+			"secret", srcKey, "source_versions", srcCount, "dest_versions", destCount)
+	}
 }
 
 func (m *Migrator) verifyVersionHashes(ctx context.Context, srcKey, dstKey string, srcMeta *kv2MetadataResp, existingState *state.Secret) (bool, error) {
