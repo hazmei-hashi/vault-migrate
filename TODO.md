@@ -4,10 +4,10 @@ Active backlog only. Obsolete historical notes removed.
 
 ## Current Baseline (2026-08-04)
 
-- 277 tests passing across 7 packages (E2E gated behind `E2E_TESTS=1`, 6
+- 283 tests passing across 7 packages (E2E gated behind `E2E_TESTS=1`, 6
   scenarios verified against a real Vault 1.18.5 cluster this session,
-  not counted in the 277)
-- Coverage: `client` 52.6%, `cmd` 35.3%, `config` 100.0%, `kvv2` 80.6%, `state` 85.5%; **total 76.6%**
+  not counted in the 283)
+- Coverage: `client` 52.6%, `cmd` 34.5%, `config` 100.0%, `kvv2` 82.7%, `state` 85.5%; **total 77.7%**
 - Phases 1-4 complete (unit, integration, mock harness, E2E)
 - Prompt desync bug fixed: shared `config.Prompt`/`PromptRequired` replaces
   `fmt.Scan`/`bufio.Scanner` mix in `client.go` and `kvv2/init.go`
@@ -28,7 +28,7 @@ Active backlog only. Obsolete historical notes removed.
 
 ### P1: CI Hardening
 - [x] Add GitHub Actions workflow for `go test ./...`
-- [x] Add coverage gate (fail build if coverage drops below target) — 73% floor, measured 76.3%
+- [x] Add coverage gate (fail build if coverage drops below target) — 73% floor, measured 77.7%
 - [x] Add coverage artifact/report publishing — `coverage.out` + `coverage.html` uploaded on every run
 - [x] Optional: add test matrix for multiple Go versions — 1.25.x + 1.26.x
 

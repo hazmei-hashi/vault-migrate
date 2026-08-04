@@ -179,7 +179,7 @@ func Rollback(dstClient *api.Client, cfg config.VaultClientConfig) error {
 	if err != nil && answer == "" {
 		return fmt.Errorf("read confirmation: %w", err)
 	}
-	// ponytail: reuse client.go:87 pattern — only "y"/"yes" (case-insensitive) proceeds.
+	// ponytail: reuse client.go prompt pattern — only "y"/"yes" (case-insensitive) proceeds.
 	if !strings.EqualFold(answer, "y") && !strings.EqualFold(answer, "yes") {
 		fmt.Println("Rollback aborted.")
 		return nil

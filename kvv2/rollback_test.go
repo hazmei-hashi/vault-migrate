@@ -596,35 +596,103 @@ func TestRollback_StateFileUntouched(t *testing.T) {
 	}
 }
 
-// TestRollback_SortedSampleIsDeterministic: same state → same sample order
-// across multiple calls (targets are sorted by dstKey).
+// TestRollback_SortedSampleIsDeterministic: the confirmation banner must list
+// sample keys in sorted (ascending) dstKey order, and must be identical
+// across repeated runs. Locks the sort.Slice at rollback.go:100 — removing
+// it makes Go map iteration randomize the order and this test fails.
+//
+// Strategy: use the confirmation-abort path (useStdinInput "n\n") so the
+// full banner prints to stdout without issuing any deletes. Capture stdout
+// via os.Pipe swap (same pattern as useStdinInput in kvv2_mock_test.go).
 func TestRollback_SortedSampleIsDeterministic(t *testing.T) {
 	src := newFakeVault(t)
 	dst := newFakeVault(t)
 
-	// Seed 10 secrets to exceed the 5-key sample window.
-	keys := []string{"c", "a", "j", "b", "g", "e", "h", "f", "d", "i"}
-	secrets := make(map[string]*state.Secret, len(keys))
-	for _, k := range keys {
+	// 10 secrets with keys inserted in non-alphabetical order.
+	// Expected sorted dstKeys: app/a, app/b, app/c, app/d, app/e, app/f, app/g, app/h, app/i, app/j
+	// Banner sample = first 5: app/a, app/b, app/c, app/d, app/e
+	unsorted := []string{"c", "a", "j", "b", "g", "e", "h", "f", "d", "i"}
+	secrets := make(map[string]*state.Secret, len(unsorted))
+	for _, k := range unsorted {
 		dst.putVersion("app/"+k, map[string]any{"v": "1"})
 		secrets["app/"+k] = &state.Secret{Status: "completed"}
 	}
-
 	stateFile := buildRollbackState(t, t.TempDir(), src, dst, secrets)
 
-	// Dry-run twice — no confirmation needed, captures log output indirectly
-	// by asserting no error and identical delete counts (0).
-	for i := 0; i < 2; i++ {
-		if err := Rollback(dst.newClient(t), config.VaultClientConfig{
-			StateFile: stateFile,
-			DstAddr:   dst.server.URL,
-			LogLevel:  "error",
-			DryRun:    true,
-		}); err != nil {
-			t.Fatalf("dry-run %d: %v", i, err)
+	// captureStdout swaps os.Stdout for a pipe, runs f(), restores, returns captured bytes.
+	captureStdout := func(f func()) []byte {
+		t.Helper()
+		origStdout := os.Stdout
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("pipe: %v", err)
+		}
+		os.Stdout = w
+
+		f()
+
+		w.Close()
+		os.Stdout = origStdout
+
+		var buf bytes.Buffer
+		if _, err := buf.ReadFrom(r); err != nil {
+			t.Fatalf("read stdout: %v", err)
+		}
+		r.Close()
+		return buf.Bytes()
+	}
+
+	runRollback := func() []byte {
+		return captureStdout(func() {
+			useStdinInput(t, "n\n")
+			_ = Rollback(dst.newClient(t), config.VaultClientConfig{
+				StateFile: stateFile,
+				DstAddr:   dst.server.URL,
+				LogLevel:  "error",
+				// DryRun=false so the banner (with sample keys) is printed
+			})
+		})
+	}
+
+	banner1 := runRollback()
+	banner2 := runRollback()
+
+	// Assert determinism: same banner both times.
+	if !bytes.Equal(banner1, banner2) {
+		t.Fatalf("banner not deterministic across runs:\nrun1: %s\nrun2: %s", banner1, banner2)
+	}
+
+	bannerStr := string(banner1)
+
+	// Assert the sample lists exactly the first 5 keys in sorted order.
+	// Keys are printed one per line as "  <dstKey>" in the sample section.
+	expectedSample := []string{"app/a", "app/b", "app/c", "app/d", "app/e"}
+	for _, key := range expectedSample {
+		if !strings.Contains(bannerStr, "  "+key) {
+			t.Errorf("expected sorted sample key %q in banner; banner:\n%s", key, bannerStr)
 		}
 	}
+
+	// Assert the first sample key in the banner appears before the second,
+	// confirming the actual printed ORDER is sorted (not just presence).
+	posA := strings.Index(bannerStr, "  app/a")
+	posB := strings.Index(bannerStr, "  app/b")
+	posC := strings.Index(bannerStr, "  app/c")
+	if posA < 0 || posB < 0 || posC < 0 {
+		t.Fatalf("expected app/a, app/b, app/c in banner; banner:\n%s", bannerStr)
+	}
+	if !(posA < posB && posB < posC) {
+		t.Fatalf("sample keys not in sorted order in banner (posA=%d posB=%d posC=%d):\n%s",
+			posA, posB, posC, bannerStr)
+	}
+
+	// Assert the "... and N more" tail is present (10 targets, sample=5).
+	if !strings.Contains(bannerStr, "... and 5 more") {
+		t.Errorf("expected '... and 5 more' in banner; banner:\n%s", bannerStr)
+	}
+
+	// No deletes should have happened (abort path).
 	if dst.deleteCalls() != 0 {
-		t.Fatalf("dry-run should have 0 deletes, got %d", dst.deleteCalls())
+		t.Fatalf("abort path: expected 0 deletes, got %d", dst.deleteCalls())
 	}
 }
