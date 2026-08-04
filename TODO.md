@@ -7,7 +7,7 @@ Active backlog only. Obsolete historical notes removed.
 - 265 tests passing across 7 packages (E2E gated behind `E2E_TESTS=1`, 6
   scenarios verified against a real Vault 1.18.5 cluster this session,
   not counted in the 265)
-- Coverage: `client` 52.6%, `cmd` 0%/35.3%, `config` 100.0%, `kvv2` 80.6%, `state` 85.5%; **total 76.3%**
+- Coverage: `client` 52.6%, `cmd` 35.3%, `config` 100.0%, `kvv2` 80.6%, `state` 85.5%; **total 76.3%**
 - Phases 1-4 complete (unit, integration, mock harness, E2E)
 - Prompt desync bug fixed: shared `config.Prompt`/`PromptRequired` replaces
   `fmt.Scan`/`bufio.Scanner` mix in `client.go` and `kvv2/init.go`
