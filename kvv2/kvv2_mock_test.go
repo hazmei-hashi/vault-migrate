@@ -100,6 +100,14 @@ type fakeVault struct {
 	forceDataWriteErrorKey     string
 	forceDataWriteErrorStatus  int
 	forceDataWriteErrorMessage string
+	// forceDataReadErrorKey/Status/Message, when Key is non-empty, makes
+	// every /data/<key> GET fail with Status/Message -- simulating a
+	// transient read failure (5xx, timeout, perms) that is NOT a
+	// soft-delete sentinel. Used to prove that a non-sentinel read error
+	// leaves the destination placeholder readable (no delete mirrored).
+	forceDataReadErrorKey     string
+	forceDataReadErrorStatus  int
+	forceDataReadErrorMessage string
 }
 
 func newFakeVault(t *testing.T) *fakeVault {
@@ -287,6 +295,19 @@ func (f *fakeVault) setForceDataWriteError(key string, status int, message strin
 	f.forceDataWriteErrorKey = key
 	f.forceDataWriteErrorStatus = status
 	f.forceDataWriteErrorMessage = message
+}
+
+// setForceDataReadError makes every subsequent /data/<key> GET fail with
+// status/message, simulating a transient read failure (5xx, perms) that is
+// NOT Vault's soft-delete 404-with-data shape. Used to prove that a
+// non-sentinel read error does NOT mirror a delete onto the destination.
+func (f *fakeVault) setForceDataReadError(key string, status int, message string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.forceDataReadErrorKey = key
+	f.forceDataReadErrorStatus = status
+	f.forceDataReadErrorMessage = message
 }
 
 // bumpCurrentVersionLocked adds a new version directly, bypassing
@@ -707,6 +728,18 @@ func (f *fakeVault) handleData(w http.ResponseWriter, r *http.Request, relKey st
 
 	switch r.Method {
 	case http.MethodGet:
+		if f.forceDataReadErrorKey != "" && f.forceDataReadErrorKey == relKey {
+			status := f.forceDataReadErrorStatus
+			if status == 0 {
+				status = http.StatusInternalServerError
+			}
+			msg := f.forceDataReadErrorMessage
+			if msg == "" {
+				msg = "injected data read failure"
+			}
+			writeJSON(w, status, map[string]any{"errors": []string{msg}})
+			return
+		}
 		sec, ok := f.secrets[relKey]
 		if !ok {
 			writeNotFound(w)
@@ -2781,6 +2814,138 @@ func TestKV2WriteData_Non400ErrorNotRetried(t *testing.T) {
 			}
 			if got := dst.metadataGETs(); got != 0 {
 				t.Fatalf("metadata GET count = %d, want 0 (no CAS retry should fire on a %d)", got, status)
+			}
+		})
+	}
+}
+
+// TestCopyPaths_TransientReadError_NoDeleteMirror is the regression lock for
+// the readFailed sentinel fix: a non-errVersionDataUnavailable read failure
+// (5xx, perms, timeout) must NOT mirror a kv2DeleteVersions call onto the
+// destination. The placeholder written just before the failed read must stay
+// readable. A genuine soft-delete (errVersionDataUnavailable) still MUST
+// mirror the delete.
+//
+// Covers all three copy paths (copyOneSecret, copySecretFull,
+// copyIncrementalVersions). Uses setForceDataReadError to inject a 500 on
+// the source version GET.
+func TestCopyPaths_TransientReadError_NoDeleteMirror(t *testing.T) {
+	placeholder := map[string]any{
+		"_vault_migrate": "placeholder",
+		"_reason":        "source_version_unavailable",
+	}
+
+	tests := []struct {
+		name        string
+		readErrCode int    // 0 = genuine soft-delete (sentinel); non-zero = transient HTTP err
+		wantDeleted bool   // should dst v1 end up soft-deleted?
+		wantReadErr bool   // do we expect copyX itself to fail?
+	}{
+		{
+			name:        "copyOneSecret / sentinel soft-delete -> delete mirrored",
+			readErrCode: 0,
+			wantDeleted: true,
+			wantReadErr: false,
+		},
+		{
+			name:        "copyOneSecret / transient 500 -> no delete mirrored",
+			readErrCode: http.StatusInternalServerError,
+			wantDeleted: false,
+			wantReadErr: false,
+		},
+		{
+			name:        "copySecretFull / sentinel soft-delete -> delete mirrored",
+			readErrCode: 0,
+			wantDeleted: true,
+			wantReadErr: false,
+		},
+		{
+			name:        "copySecretFull / transient 500 -> no delete mirrored",
+			readErrCode: http.StatusInternalServerError,
+			wantDeleted: false,
+			wantReadErr: false,
+		},
+		{
+			name:        "copyIncrementalVersions / sentinel soft-delete -> delete mirrored",
+			readErrCode: 0,
+			wantDeleted: true,
+			wantReadErr: false,
+		},
+		{
+			name:        "copyIncrementalVersions / transient 500 -> no delete mirrored",
+			readErrCode: http.StatusInternalServerError,
+			wantDeleted: false,
+			wantReadErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			src := newFakeVault(t)
+			dst := newFakeVault(t)
+
+			// Write and immediately soft-delete v1 for sentinel cases,
+			// or write a real v1 and inject a 500 for transient cases.
+			src.putVersion("app/secret", map[string]any{"value": "v1"})
+			if tt.readErrCode == 0 {
+				src.markVersionDeleted("app/secret", 1)
+			} else {
+				src.setForceDataReadError("app/secret", tt.readErrCode, "injected transient failure")
+			}
+
+			m := newTestMigrator(t, src, dst, true)
+			// Disable SDK-level retries on the src client so a 500 fails fast.
+			m.Src.Client.SetMaxRetries(0)
+
+			srcMeta, err := m.kv2ReadMetadata(context.Background(), m.Src, "app/secret")
+			if err != nil {
+				t.Fatalf("kv2ReadMetadata src failed: %v", err)
+			}
+
+			var copyErr error
+			switch {
+			case strings.HasPrefix(tt.name, "copyOneSecret"):
+				copyErr = m.copyOneSecret(context.Background(), "app/secret", "app/secret", Options{Placeholder: placeholder})
+			case strings.HasPrefix(tt.name, "copySecretFull"):
+				copyErr = m.copySecretFull(context.Background(), "app/secret", "app/secret", srcMeta, Options{Placeholder: placeholder})
+			default:
+				copyErr = m.copyIncrementalVersions(context.Background(), "app/secret", "app/secret", srcMeta, 1, 1, Options{Placeholder: placeholder})
+			}
+
+			if tt.wantReadErr {
+				if copyErr == nil {
+					t.Fatalf("expected copy to fail on transient read error, got nil")
+				}
+				return
+			}
+			if copyErr != nil {
+				t.Fatalf("copy unexpectedly failed: %v", copyErr)
+			}
+
+			dstMeta, err := m.kv2ReadMetadata(context.Background(), m.Dst, "app/secret")
+			if err != nil {
+				t.Fatalf("kv2ReadMetadata dst failed: %v", err)
+			}
+			v1meta, ok := dstMeta.Data.Versions["1"]
+			if !ok {
+				t.Fatalf("dst v1 not found in metadata")
+			}
+
+			deleted := v1meta.DeletionTime != ""
+			if deleted != tt.wantDeleted {
+				t.Fatalf("dst v1 deleted = %v, want %v (DeletionTime=%q)", deleted, tt.wantDeleted, v1meta.DeletionTime)
+			}
+
+			if !tt.wantDeleted {
+				// Placeholder must be readable (not soft-deleted).
+				data := dst.rawVersionData("app/secret", 1)
+				if len(data) == 0 {
+					t.Fatalf("dst v1 has no stored payload; placeholder should be readable")
+				}
+				if data["_vault_migrate"] != "placeholder" {
+					t.Fatalf("dst v1 payload = %v, want placeholder", data)
+				}
 			}
 		})
 	}

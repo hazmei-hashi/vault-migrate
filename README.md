@@ -300,6 +300,7 @@ After any full or incremental copy (cases 1, 2, and 3), if the destination's mea
 - Source version timestamps are not preserved on destination.
 - Destroyed source payloads are unrecoverable; tool writes placeholder then marks destination version destroyed.
 - Soft-deleted source payloads are also unrecoverable at read time (Vault returns no data for them); the tool writes the configured placeholder then marks the destination version deleted to match, instead of writing an empty/null payload.
+- A transient read failure (5xx, timeout, permission error) on a source version also writes the placeholder to the destination, but does NOT mirror a soft-delete — the destination version stays readable. State labels the version `read_error`. Only a genuine Vault soft-delete sentinel (`errVersionDataUnavailable`, i.e. Vault's 404-with-data shape for a deleted/destroyed version) causes the destination delete to be mirrored.
 - Token renewal is not handled; token TTL must exceed migration duration.
 - State file is single-writer; do not share one `-stateFile` across parallel migrations.
 - State file writes are atomic against a killed process (temp file in the same directory + `os.Rename`), but NOT against power loss — there is no `fsync` before the rename, so a hard crash at the wrong instant can still leave a lost (not corrupted) write on some filesystems.

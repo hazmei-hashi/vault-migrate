@@ -179,40 +179,44 @@ func (m *Migrator) copyOneSecret(ctx context.Context, srcKey, dstKey string, opt
 		if vm.Destroyed {
 			payload = opts.Placeholder
 		} else {
-			p, rerr := m.kv2ReadVersion(ctx, m.Src, srcKey, v)
-			if rerr != nil {
-				payload = opts.Placeholder
-				readFailed = true
-			} else {
-				payload = p
-			}
-		}
-
-		if err := m.kv2WriteData(ctx, m.Dst, dstKey, payload); err != nil {
-			return fmt.Errorf("write dst v=%d: %w", v, err)
-		}
-		payload = nil
-
-		if vm.Destroyed {
-			if err := m.kv2DestroyVersions(ctx, m.Dst, dstKey, []int{v}); err != nil {
-				return fmt.Errorf("destroy dst v=%d: %w", v, err)
-			}
-		} else if readFailed {
-			// B18: only mirror a delete onto the destination when the
-			// source read actually failed to produce data (soft-deleted,
-			// errVersionDataUnavailable). vm.DeletionTime != "" alone is
-			// NOT sufficient -- a future-dated delete_version_after sets
-			// this field while the version is still fully readable, and
-			// the branch above just wrote its REAL data to the
-			// destination; soft-deleting it here would destroy live data
-			// that was correctly copied one line earlier.
-			if err := m.kv2DeleteVersions(ctx, m.Dst, dstKey, []int{v}); err != nil {
-				return fmt.Errorf("delete dst v=%d: %w", v, err)
-			}
+		p, rerr := m.kv2ReadVersion(ctx, m.Src, srcKey, v)
+		if rerr != nil {
+			payload = opts.Placeholder
+			// Gate readFailed on the sentinel: only a genuine soft-delete
+			// (errVersionDataUnavailable) should mirror a delete onto the
+			// destination. A transient error (5xx, timeout, perms) leaves
+			// the placeholder written above intact -- no delete mirrored.
+			readFailed = errors.Is(rerr, errVersionDataUnavailable)
+		} else {
+			payload = p
 		}
 	}
 
-	if err := m.kv2WriteMetadataSettings(ctx, m.Dst, dstKey, meta); err != nil {
+	if err := m.kv2WriteData(ctx, m.Dst, dstKey, payload); err != nil {
+		return fmt.Errorf("write dst v=%d: %w", v, err)
+	}
+	payload = nil
+
+	if vm.Destroyed {
+		if err := m.kv2DestroyVersions(ctx, m.Dst, dstKey, []int{v}); err != nil {
+			return fmt.Errorf("destroy dst v=%d: %w", v, err)
+		}
+	} else if readFailed {
+		// B18: only mirror a delete onto the destination when the
+		// source read actually failed to produce data (soft-deleted,
+		// errVersionDataUnavailable). vm.DeletionTime != "" alone is
+		// NOT sufficient -- a future-dated delete_version_after sets
+		// this field while the version is still fully readable, and
+		// the branch above just wrote its REAL data to the
+		// destination; soft-deleting it here would destroy live data
+		// that was correctly copied one line earlier.
+		if err := m.kv2DeleteVersions(ctx, m.Dst, dstKey, []int{v}); err != nil {
+			return fmt.Errorf("delete dst v=%d: %w", v, err)
+		}
+	}
+}
+
+if err := m.kv2WriteMetadataSettings(ctx, m.Dst, dstKey, meta); err != nil {
 		return fmt.Errorf("write metadata settings: %w", err)
 	}
 
@@ -365,20 +369,23 @@ func (m *Migrator) copySecretFull(ctx context.Context, srcKey, dstKey string, sr
 			payload = opts.Placeholder
 			versionState = "destroyed"
 		} else {
-			p, rerr := m.kv2ReadVersion(ctx, m.Src, srcKey, v)
-			if rerr != nil {
-				payload = opts.Placeholder
-				readFailed = true
-				// B18: errVersionDataUnavailable is Vault's own signal
-				// that this version is genuinely soft-deleted (whatever
-				// triggered it -- an explicit delete, or a past
-				// delete_version_after deadline). Any other error is a
-				// real read failure (network, 5xx, etc.), not a delete.
-				if errors.Is(rerr, errVersionDataUnavailable) {
-					versionState = "deleted"
-				} else {
-					versionState = "read_error"
-				}
+		p, rerr := m.kv2ReadVersion(ctx, m.Src, srcKey, v)
+		if rerr != nil {
+			payload = opts.Placeholder
+			// Gate readFailed on the sentinel: only a genuine soft-delete
+			// (errVersionDataUnavailable) mirrors a delete onto the
+			// destination. Transient errors keep the placeholder readable.
+			readFailed = errors.Is(rerr, errVersionDataUnavailable)
+			// B18: errVersionDataUnavailable is Vault's own signal
+			// that this version is genuinely soft-deleted (whatever
+			// triggered it -- an explicit delete, or a past
+			// delete_version_after deadline). Any other error is a
+			// real read failure (network, 5xx, etc.), not a delete.
+			if errors.Is(rerr, errVersionDataUnavailable) {
+				versionState = "deleted"
+			} else {
+				versionState = "read_error"
+			}
 			} else {
 				// B18 CRITICAL: the read succeeded with real data, so
 				// this version is live REGARDLESS of vm.DeletionTime --
@@ -493,18 +500,21 @@ func (m *Migrator) copyIncrementalVersions(ctx context.Context, srcKey, dstKey s
 			payload = opts.Placeholder
 			versionState = "destroyed"
 		} else {
-			p, rerr := m.kv2ReadVersion(ctx, m.Src, srcKey, v)
-			if rerr != nil {
-				payload = opts.Placeholder
-				readFailed = true
-				// B18: see copySecretFull -- errVersionDataUnavailable is
-				// Vault's own signal this version is genuinely
-				// soft-deleted; any other error is a real read failure.
-				if errors.Is(rerr, errVersionDataUnavailable) {
-					versionState = "deleted"
-				} else {
-					versionState = "read_error"
-				}
+		p, rerr := m.kv2ReadVersion(ctx, m.Src, srcKey, v)
+		if rerr != nil {
+			payload = opts.Placeholder
+			// Gate readFailed on the sentinel: only a genuine soft-delete
+			// (errVersionDataUnavailable) mirrors a delete onto the
+			// destination. Transient errors keep the placeholder readable.
+			readFailed = errors.Is(rerr, errVersionDataUnavailable)
+			// B18: see copySecretFull -- errVersionDataUnavailable is
+			// Vault's own signal this version is genuinely
+			// soft-deleted; any other error is a real read failure.
+			if errors.Is(rerr, errVersionDataUnavailable) {
+				versionState = "deleted"
+			} else {
+				versionState = "read_error"
+			}
 			} else {
 				// B18 CRITICAL: read succeeded with real data -> live
 				// regardless of vm.DeletionTime (future-dated
