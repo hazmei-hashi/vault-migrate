@@ -349,6 +349,13 @@ Active backlog only. Obsolete historical notes removed.
   full recopy, which re-pruned to the identical state — repeating on EVERY
   run. Non-idempotent and destructive, worst when local state was
   absent/stale. Genuine mismatches are still detected and recopied.
+- Follow-up (Copilot review, PR #9): `verifyDestinationMatches` no longer
+  redundantly re-reads destination metadata — `copyOneSecretWithState`
+  already fetched `dstMeta` before calling it, and a transient failure on
+  that second, unnecessary read was itself treated as "verification
+  failed", triggering the same `kv2DeleteSecret` + full recopy path above.
+  Fixed by passing the caller's already-fetched `dstMeta` in instead of
+  reading it again.
 - Mock fidelity improved: `newFakeVault` now serves real Vault's
   404-with-data shape for destroyed/soft-deleted version reads (rather than
   a bare error), enforces per-secret and mount-level `max_versions`

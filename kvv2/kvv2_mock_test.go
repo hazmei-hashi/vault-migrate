@@ -1770,7 +1770,12 @@ func TestVerifyDestinationMatches(t *testing.T) {
 			t.Fatalf("read src metadata failed: %v", err)
 		}
 
-		ok, err := m.verifyDestinationMatches(context.Background(), "app/secret", "app/secret", srcMeta)
+		dstMeta, err := m.kv2ReadMetadata(context.Background(), m.Dst, "app/secret")
+		if err != nil {
+			t.Fatalf("read dst metadata failed: %v", err)
+		}
+
+		ok, err := m.verifyDestinationMatches(context.Background(), "app/secret", "app/secret", srcMeta, dstMeta)
 		if err != nil {
 			t.Fatalf("verifyDestinationMatches err = %v", err)
 		}
@@ -1795,7 +1800,12 @@ func TestVerifyDestinationMatches(t *testing.T) {
 			t.Fatalf("read src metadata failed: %v", err)
 		}
 
-		ok, err := m.verifyDestinationMatches(context.Background(), "app/secret", "app/secret", srcMeta)
+		dstMeta, err := m.kv2ReadMetadata(context.Background(), m.Dst, "app/secret")
+		if err != nil {
+			t.Fatalf("read dst metadata failed: %v", err)
+		}
+
+		ok, err := m.verifyDestinationMatches(context.Background(), "app/secret", "app/secret", srcMeta, dstMeta)
 		if err != nil {
 			t.Fatalf("verifyDestinationMatches err = %v", err)
 		}
@@ -2144,8 +2154,12 @@ func TestVerifyDestinationMatches_PrunedVersionSkipped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read src metadata failed: %v", err)
 	}
+	dstMeta, err := m.kv2ReadMetadata(context.Background(), m.Dst, "app/secret")
+	if err != nil {
+		t.Fatalf("read dst metadata failed: %v", err)
+	}
 
-	ok, err := m.verifyDestinationMatches(context.Background(), "app/secret", "app/secret", srcMeta)
+	ok, err := m.verifyDestinationMatches(context.Background(), "app/secret", "app/secret", srcMeta, dstMeta)
 	if err != nil {
 		t.Fatalf("verifyDestinationMatches err = %v, want nil (pruned version must be skipped, not errored)", err)
 	}

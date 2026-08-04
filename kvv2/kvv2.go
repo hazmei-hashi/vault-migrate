@@ -284,7 +284,7 @@ func (m *Migrator) copyOneSecretWithState(ctx context.Context, srcKey, dstKey st
 			} else {
 				// No state or no hashes - need to verify by reading actual data
 				m.Logger.Debug("Verifying destination secret (no state)", "secret", srcKey)
-				allMatch, err := m.verifyDestinationMatches(ctx, srcKey, dstKey, srcMeta)
+				allMatch, err := m.verifyDestinationMatches(ctx, srcKey, dstKey, srcMeta, dstMeta)
 				if err != nil {
 					m.Logger.Warn("Failed to verify destination", "secret", srcKey, "err", err)
 					// On verification error, recreate to be safe
@@ -659,13 +659,8 @@ func (m *Migrator) verifyVersionHashes(ctx context.Context, srcKey, dstKey strin
 	return true, nil
 }
 
-func (m *Migrator) verifyDestinationMatches(ctx context.Context, srcKey, dstKey string, srcMeta *kv2MetadataResp) (bool, error) {
+func (m *Migrator) verifyDestinationMatches(ctx context.Context, srcKey, dstKey string, srcMeta, dstMeta *kv2MetadataResp) (bool, error) {
 	maxV := getMaxVersion(srcMeta)
-
-	dstMeta, err := m.kv2ReadMetadata(ctx, m.Dst, dstKey)
-	if err != nil {
-		return false, fmt.Errorf("read destination metadata: %w", err)
-	}
 
 	for v := 1; v <= maxV; v++ {
 		vm, ok := srcMeta.Data.Versions[strconv.Itoa(v)]
