@@ -253,6 +253,7 @@ The CLI supports these flags:
 | `-clientTimeout` | `60s` | Validated as `> 0` at startup; HTTP client timeout for Vault API requests (`SetClientTimeout`) |
 | `-continueOnError` | `false` | Continue migration after per-secret copy errors |
 | `-dryRun` | `false` | Show what would be copied without writing to the destination |
+| `-rollback` | `false` | Delete destination secrets listed in the state file. Requires `-stateFile`; incompatible with `-noState`. See [Rollback](#rollback) |
 
 If a flag is omitted, the tool prompts for the missing value at runtime, in the order listed under [Prompt Order](#prompt-order). Empty input at the mount prompts is rejected and re-prompted; empty input at the base path or namespace prompts is accepted and means root.
 
@@ -314,6 +315,88 @@ After any full or incremental copy (cases 1, 2, and 3), if the destination's mea
 - Vault client timeout is configurable via `-clientTimeout` (default 60s per request).
 - A source mount/base path that resolves to zero secrets (missing mount, KV v1 mount, typo'd mount or base path) makes the migration fail rather than report success; the SDK cannot distinguish those cases from a genuinely empty mount.
 - Migrating into a `cas_required` destination is supported via a reactive check-and-set retry: `kv2WriteData` sends the same request as always (no `options.cas`) on the first attempt. If — and only if — that write is rejected with `400 check-and-set parameter required for this call` (destination mount tunable OR destination secret's own `cas_required`), it reads the destination's current version via `<mount>/metadata/*` and retries exactly once with `options.cas` set to that version. On every other destination (the overwhelming majority of real runs) this is byte-identical to the pre-existing wire format — no extra request, no `options` key on the write at all. The one-time extra round trip only happens on a `cas_required` destination, and only after the first write already failed. A genuine concurrent-writer CAS mismatch on the retry is not looped — it propagates as a loud failure, same as any other write error. Requires no new token permission: destination `read` on `<mount>/metadata/*` was already required (see Token Policy Requirements above). Verified against a real Vault cluster (`test/e2e/e2e_test.go`'s `TestE2E_CASRequiredMountDestination`, `TestE2E_CASRequiredPerSecretDestination`, `TestE2E_SourceCASRequiredIncremental`), in addition to mock coverage.
+
+## Rollback
+
+`-rollback` deletes destination secrets that were successfully migrated,
+as recorded in the state file.
+
+> **⚠ WARNING: IRREVERSIBLE operation.** Metadata-delete permanently destroys
+> ALL versions and ALL metadata for each targeted secret. There is no undo.
+> Use `-dryRun` to preview before committing.
+
+**Targets**: only secrets with status `completed` or `recreated`. Secrets with
+status `failed`, `skipped`, or any other value are left untouched.
+
+**`recreated` caveat**: secrets with status `recreated` existed on the
+destination BEFORE migration — migration overwrote them. Rollback deletes them
+entirely; it does NOT restore the pre-migration version. These secrets will be
+**permanently lost**, not restored. The confirmation banner calls this out with
+a count and a warning.
+
+**Wrong-cluster guard**: rollback validates the operator-supplied `-dstAddr`
+and `-dstNamespace` against the state file's recorded destination before
+issuing any deletes. A mismatch is a hard error with zero delete calls. This
+prevents a fat-fingered or stale `-dstAddr` from mass-deleting secrets on a
+cluster that was never migrated to.
+
+**Key mapping**: destination keys are derived via the same `dstKeyFor` logic
+as the original migration, using source/destination base paths from the state
+file's `ClusterInfo` — not re-prompted, so key mappings always match the
+original run exactly.
+
+**State file**: left untouched after rollback. A note is printed at completion.
+Manually delete or archive the state file if needed.
+
+**Source cluster**: still required. Both clients are built by the normal
+`BuildClients` path, which requires a reachable source cluster and valid source
+token. The source client is not used during rollback itself; this is a
+limitation of the current CLI architecture.
+
+**Confirmation**: prints the target cluster (address, namespace, mount, base
+path), a count, and a sample of destination keys before prompting `[y/N]`
+(default No). Use `-dryRun` to preview without prompting.
+
+**Errors**: per-secret delete failures abort by default; use `-continueOnError`
+to process remaining secrets and report failure count at the end.
+
+**Idempotent on absent secrets**: a destination secret already deleted returns
+204 from Vault's metadata-DELETE (idempotent). It is counted as `deleted`.
+Routing 404s (wrong mount, wrong namespace, non-KV path) are distinct: if ALL
+targeted secrets return routing 404s and zero are actually deleted, rollback
+refuses to report success (consistent with B9's "refusing to report success"
+pattern).
+
+### Example
+
+Preview what would be deleted:
+
+```bash
+./vault-migrate \
+  -srcAddr https://vault-source.example.com:8200 \
+  -srcToken "$SRC_TOKEN" \
+  -dstAddr https://vault-dest.example.com:8200 \
+  -dstToken "$DST_TOKEN" \
+  -stateFile .vault-migrate-state.json \
+  -rollback \
+  -dryRun
+```
+
+Execute rollback:
+
+```bash
+./vault-migrate \
+  -srcAddr https://vault-source.example.com:8200 \
+  -srcToken "$SRC_TOKEN" \
+  -dstAddr https://vault-dest.example.com:8200 \
+  -dstToken "$DST_TOKEN" \
+  -stateFile .vault-migrate-state.json \
+  -rollback
+```
+
+### Destination token requirements for rollback
+
+- `delete` on `<mount>/metadata/*`
 
 ## Security Notes
 

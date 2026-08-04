@@ -30,6 +30,7 @@ func Init() {
 	flag.DurationVar(&c.ClientTimeout, "clientTimeout", 60*time.Second, "HTTP client timeout for Vault API requests")
 	flag.BoolVar(&c.ContinueOnError, "continueOnError", false, "Continue migration even if individual secrets fail")
 	flag.BoolVar(&c.DryRun, "dryRun", false, "Preview migration without making changes")
+	flag.BoolVar(&c.Rollback, "rollback", false, "Delete destination secrets listed in the state file (requires -stateFile; incompatible with -noState)")
 	flag.Parse()
 
 	setFlags := make(config.SetFlags)
@@ -51,7 +52,11 @@ func Init() {
 
 	switch c.Mode {
 	case "kvv2":
-		err = kvv2.Init(srcClient, dstClient, c)
+		if c.Rollback {
+			err = kvv2.Rollback(dstClient, c)
+		} else {
+			err = kvv2.Init(srcClient, dstClient, c)
+		}
 	default:
 		log.Fatal("Supported modes: kvv2")
 	}
@@ -98,6 +103,14 @@ func validateConfig(c config.VaultClientConfig) error {
 
 	if c.StateFile == "" && !c.NoState {
 		return fmt.Errorf("stateFile cannot be empty when state tracking is enabled")
+	}
+
+	if c.Rollback && c.NoState {
+		return fmt.Errorf("-rollback and -noState are incompatible: rollback requires a state file")
+	}
+
+	if c.Rollback && c.StateFile == "" {
+		return fmt.Errorf("-rollback requires -stateFile")
 	}
 
 	return nil

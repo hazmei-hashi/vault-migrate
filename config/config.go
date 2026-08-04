@@ -24,6 +24,7 @@ type VaultClientConfig struct {
 	ClientTimeout   time.Duration
 	ContinueOnError bool
 	DryRun          bool
+	Rollback        bool
 }
 
 type SetFlags map[string]bool

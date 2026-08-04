@@ -108,6 +108,12 @@ type fakeVault struct {
 	forceDataReadErrorKey     string
 	forceDataReadErrorStatus  int
 	forceDataReadErrorMessage string
+	// forceMetadataDeleteErrorKey/Status, when Key is non-empty, makes a
+	// metadata DELETE for that key fail with Status (default 500). Used by
+	// TestRollback_ContinueOnError to simulate a per-secret delete failure
+	// so the test can prove remaining secrets are still processed.
+	forceMetadataDeleteErrorKey    string
+	forceMetadataDeleteErrorStatus int
 }
 
 func newFakeVault(t *testing.T) *fakeVault {
@@ -308,6 +314,16 @@ func (f *fakeVault) setForceDataReadError(key string, status int, message string
 	f.forceDataReadErrorKey = key
 	f.forceDataReadErrorStatus = status
 	f.forceDataReadErrorMessage = message
+}
+
+// setForceMetadataDeleteError makes a metadata DELETE for key fail with status
+// (default 500), used to simulate per-secret delete failures in rollback tests.
+func (f *fakeVault) setForceMetadataDeleteError(key string, status int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.forceMetadataDeleteErrorKey = key
+	f.forceMetadataDeleteErrorStatus = status
 }
 
 // bumpCurrentVersionLocked adds a new version directly, bypassing
@@ -648,6 +664,14 @@ func (f *fakeVault) handleMetadata(w http.ResponseWriter, r *http.Request, relKe
 
 	switch r.Method {
 	case http.MethodDelete:
+		if f.forceMetadataDeleteErrorKey != "" && f.forceMetadataDeleteErrorKey == relKey {
+			status := f.forceMetadataDeleteErrorStatus
+			if status == 0 {
+				status = http.StatusInternalServerError
+			}
+			writeJSON(w, status, map[string]any{"errors": []string{"injected delete failure"}})
+			return
+		}
 		delete(f.secrets, relKey)
 		f.deleteSecretCalls++
 		w.WriteHeader(http.StatusNoContent)

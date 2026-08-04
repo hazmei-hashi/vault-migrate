@@ -4,10 +4,10 @@ Active backlog only. Obsolete historical notes removed.
 
 ## Current Baseline (2026-08-04)
 
-- 265 tests passing across 7 packages (E2E gated behind `E2E_TESTS=1`, 6
+- 277 tests passing across 7 packages (E2E gated behind `E2E_TESTS=1`, 6
   scenarios verified against a real Vault 1.18.5 cluster this session,
-  not counted in the 265)
-- Coverage: `client` 52.6%, `cmd` 35.3%, `config` 100.0%, `kvv2` 80.6%, `state` 85.5%; **total 76.3%**
+  not counted in the 277)
+- Coverage: `client` 52.6%, `cmd` 35.3%, `config` 100.0%, `kvv2` 80.6%, `state` 85.5%; **total 76.6%**
 - Phases 1-4 complete (unit, integration, mock harness, E2E)
 - Prompt desync bug fixed: shared `config.Prompt`/`PromptRequired` replaces
   `fmt.Scan`/`bufio.Scanner` mix in `client.go` and `kvv2/init.go`
@@ -36,9 +36,9 @@ All three landed in `.github/workflows/ci.yml` (new PR/push CI). Previously only
 `release-build.yml` (tag-triggered release gate) existed; it has no coverage gate or matrix.
 
 ### P2: Rollback Capability
-- Add `-rollback` mode
-- Read state file and delete destination secrets listed in state
-- Add dry-run/confirmation behavior for rollback flow
+- [x] Add `-rollback` mode
+- [x] Read state file and delete destination secrets listed in state
+- [x] Add dry-run/confirmation behavior for rollback flow
 
 ### P3: Concurrency
 - Add worker-pool based copy mode (configurable worker count)
