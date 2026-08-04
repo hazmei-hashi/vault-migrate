@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -268,6 +269,27 @@ func (f *fakeVault) removeVersion(key string, version int) {
 	delete(sec.Versions, version)
 }
 
+// rawVersionData reads a version's stored payload directly out of the
+// fake's internal map, bypassing handleData's soft-delete/destroy 404
+// gating. Needed for B18's tests: once a version is soft-deleted,
+// kv2ReadVersion (correctly) errors on it, but the tests still need to
+// assert on what payload actually got WRITTEN before the delete call --
+// a real placeholder vs. the pre-fix null write.
+func (f *fakeVault) rawVersionData(key string, version int) map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	sec, ok := f.secrets[key]
+	if !ok {
+		return nil
+	}
+	vm, ok := sec.Versions[version]
+	if !ok {
+		return nil
+	}
+	return vm.Data
+}
+
 func (f *fakeVault) markVersionDeleted(key string, version int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -281,6 +303,29 @@ func (f *fakeVault) markVersionDeleted(key string, version int) {
 		return
 	}
 	vm.DeletionTime = time.Now().UTC().Format(time.RFC3339)
+}
+
+// markVersionDeletionScheduled sets a deletion_time on a version WITHOUT
+// making it unreadable, for the B18 regression test: `delete_version_after`
+// stamps a future deletion_time on write, and real Vault keeps that
+// version's data fully readable until the deadline actually passes
+// (vault-plugin-secrets-kv path_data.go). Passing a time.Time in the past
+// behaves the same as markVersionDeleted; passing one in the future
+// reproduces the "readable, deletion_time set" case the B18 fix must not
+// treat as unavailable.
+func (f *fakeVault) markVersionDeletionScheduled(key string, version int, deletionTime time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	sec, ok := f.secrets[key]
+	if !ok {
+		return
+	}
+	vm, ok := sec.Versions[version]
+	if !ok {
+		return
+	}
+	vm.DeletionTime = deletionTime.UTC().Format(time.RFC3339)
 }
 
 func (f *fakeVault) markVersionDestroyed(key string, version int) {
@@ -400,6 +445,26 @@ func writeNotFound(w http.ResponseWriter) {
 	writeJSON(w, http.StatusNotFound, map[string]any{
 		"errors": []string{"not found"},
 	})
+}
+
+// isActuallyDeleted reports whether a version's deletion_time deadline has
+// passed. An empty deletionTime means never scheduled for deletion. A
+// deletionTime that fails to parse is treated as already-deleted -- real
+// Vault's own timestamp is always well-formed, so a bad value here is a
+// test-construction mistake, not a case worth silently treating as
+// "readable". Used by handleData so a FUTURE-dated deletion_time (set via
+// `delete_version_after`) keeps serving real data, per B18's critical
+// warning: skip-on-read must key off the read itself producing nil data,
+// never off DeletionTime != "" alone.
+func isActuallyDeleted(deletionTime string) bool {
+	if deletionTime == "" {
+		return false
+	}
+	t, err := time.Parse(time.RFC3339, deletionTime)
+	if err != nil {
+		return true
+	}
+	return !t.After(time.Now().UTC())
 }
 
 // writeNotFoundWithData serves real Vault's shape for a read against a
@@ -578,9 +643,19 @@ func (f *fakeVault) handleData(w http.ResponseWriter, r *http.Request, relKey st
 			writeNotFound(w)
 			return
 		}
-		if v.Destroyed || v.DeletionTime != "" {
+		if v.Destroyed || isActuallyDeleted(v.DeletionTime) {
 			// Version exists but has been soft-deleted or destroyed ->
 			// real Vault serves 404-with-data (see writeNotFoundWithData).
+			//
+			// A non-empty DeletionTime alone does NOT mean unreadable:
+			// `delete_version_after` stamps a FUTURE deletion_time on the
+			// version metadata at write time, but real Vault's KV v2
+			// plugin only actually soft-deletes the version once its
+			// background reaper fires at that deadline
+			// (delete_version_after.go) -- the data stays fully readable
+			// until then. isActuallyDeleted checks the deadline has
+			// passed, not just that the field is set (B18 regression
+			// coverage for exactly this distinction).
 			writeNotFoundWithData(w, version, v.Destroyed, v.DeletionTime)
 			return
 		}
@@ -1234,40 +1309,223 @@ func TestCopyOneSecret_HandlesVersionEdgeCases(t *testing.T) {
 	}
 }
 
-// TestCopyOneSecret_BugA_DeletedVersionReadSucceedsWithEmptyPayload documents
-// a real, pre-existing behavior difference exposed by Task 1a's mock
-// fidelity fix (404-with-data for deleted/destroyed versions), filed as
-// "bug A" and explicitly OUT OF SCOPE for this change set.
-//
-// kv2ReadVersion (kvv2.go) treats any non-error, non-nil api.Secret as
-// success and returns sec.Data.Data. Real Vault's SDK reports a
-// 404-with-data response (deleted version) as SUCCESS -- api/secret.go's
-// DeepEqual check sees warnings/data present and skips the errors branch,
-// then api/logical.go's ParseRawResponseAndCloseBody returns (secret, nil)
-// because len(secret.Data) > 0. The "data" sub-key is nil (real Vault: the
-// payload itself is null), so kv2ReadVersion returns (nil-map, nil) instead
-// of an error -- copyOneSecret's `if rerr != nil { payload = opts.Placeholder }`
-// branch never fires for a *deleted* version's read, only for a genuinely
-// erroring read. The version still gets marked deleted afterward (correct),
-// but the payload written to the destination is an empty map, not the
-// configured placeholder. This test asserts the CURRENT (buggy) behavior so
-// a future fix is a deliberate, visible diff here rather than a silent
-// behavior change.
-func TestCopyOneSecret_BugA_DeletedVersionReadSucceedsWithEmptyPayload(t *testing.T) {
+// TestKV2ReadVersion_SoftDeletedVersionReturnsErrVersionDataUnavailable is
+// B18's unit-level fix proof: kv2ReadVersion must turn Vault's
+// 404-with-data ("read succeeded but data is nil") shape for a
+// soft-deleted version into errVersionDataUnavailable, not a silent
+// (nil-map, nil) success. Previously named
+// TestCopyOneSecret_BugA_DeletedVersionReadSucceedsWithEmptyPayload and
+// asserted the opposite (buggy) behavior -- renamed and inverted now that
+// the bug is fixed.
+func TestKV2ReadVersion_SoftDeletedVersionReturnsErrVersionDataUnavailable(t *testing.T) {
 	src := newFakeVault(t)
 	dst := newFakeVault(t)
 
-	src.putVersion("app/buga", map[string]any{"value": "v1"})
-	src.markVersionDeleted("app/buga", 1)
+	src.putVersion("app/softdel", map[string]any{"value": "v1"})
+	src.markVersionDeleted("app/softdel", 1)
 
 	m := newTestMigrator(t, src, dst, false)
 
-	payload, err := m.kv2ReadVersion(context.Background(), m.Src, "app/buga", 1)
-	if err != nil {
-		t.Fatalf("bug A regressed: kv2ReadVersion now errors on a deleted version (%v); if intentionally fixed, update/remove this test and close bug A", err)
+	payload, err := m.kv2ReadVersion(context.Background(), m.Src, "app/softdel", 1)
+	if !errors.Is(err, errVersionDataUnavailable) {
+		t.Fatalf("kv2ReadVersion err = %v, want errVersionDataUnavailable", err)
 	}
-	if len(payload) != 0 {
-		t.Fatalf("bug A regressed: kv2ReadVersion returned non-empty payload %v for a deleted version; if intentionally fixed, update/remove this test and close bug A", payload)
+	if payload != nil {
+		t.Fatalf("kv2ReadVersion payload = %v, want nil alongside the error", payload)
+	}
+}
+
+// TestCopyPaths_SoftDeletedVersionGetsPlaceholder is B18's end-to-end proof
+// across all three copy paths: a soft-deleted source version must produce
+// the configured placeholder on the destination (with "_reason" present),
+// never a null/empty payload, and the state label for that version must
+// stay "deleted" (copySecretFull/copyIncrementalVersions only -- copyOneSecret
+// does not track VersionStates at all).
+func TestCopyPaths_SoftDeletedVersionGetsPlaceholder(t *testing.T) {
+	placeholder := map[string]any{
+		"_vault_migrate": "placeholder",
+		"_reason":        "source_version_unavailable",
+	}
+
+	tests := []struct {
+		name string
+		run  func(t *testing.T, m *Migrator, srcMeta *kv2MetadataResp) (versionStates map[string]string)
+	}{
+		{
+			name: "copyOneSecret",
+			run: func(t *testing.T, m *Migrator, _ *kv2MetadataResp) map[string]string {
+				if err := m.copyOneSecret(context.Background(), "app/softdel", "app/softdel", Options{Placeholder: placeholder}); err != nil {
+					t.Fatalf("copyOneSecret failed: %v", err)
+				}
+				return nil
+			},
+		},
+		{
+			name: "copySecretFull",
+			run: func(t *testing.T, m *Migrator, srcMeta *kv2MetadataResp) map[string]string {
+				if err := m.copySecretFull(context.Background(), "app/softdel", "app/softdel", srcMeta, Options{Placeholder: placeholder}); err != nil {
+					t.Fatalf("copySecretFull failed: %v", err)
+				}
+				return m.State.GetSecret("app/softdel").VersionStates
+			},
+		},
+		{
+			name: "copyIncrementalVersions",
+			run: func(t *testing.T, m *Migrator, srcMeta *kv2MetadataResp) map[string]string {
+				// Seed dest with nothing so the whole range [1,1] is
+				// "incremental" -- exercises the same loop body as a real
+				// incremental run picking up a soft-deleted tail version.
+				if err := m.copyIncrementalVersions(context.Background(), "app/softdel", "app/softdel", srcMeta, 1, 1, Options{Placeholder: placeholder}); err != nil {
+					t.Fatalf("copyIncrementalVersions failed: %v", err)
+				}
+				return m.State.GetSecret("app/softdel").VersionStates
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			src := newFakeVault(t)
+			dst := newFakeVault(t)
+
+			src.putVersion("app/softdel", map[string]any{"value": "v1"})
+			src.markVersionDeleted("app/softdel", 1)
+
+			m := newTestMigrator(t, src, dst, true)
+
+			srcMeta, err := m.kv2ReadMetadata(context.Background(), m.Src, "app/softdel")
+			if err != nil {
+				t.Fatalf("kv2ReadMetadata src failed: %v", err)
+			}
+
+			versionStates := tt.run(t, m, srcMeta)
+
+			// The destination version itself was soft-deleted to mirror
+			// the source, so read the underlying stored payload directly
+			// rather than through kv2ReadVersion (which would now, itself
+			// correctly, return errVersionDataUnavailable).
+			gotPayload := dst.rawVersionData("app/softdel", 1)
+			if len(gotPayload) == 0 {
+				t.Fatalf("dst v1 payload is empty; want the configured placeholder written before soft-delete")
+			}
+			if gotPayload["_reason"] != "source_version_unavailable" {
+				t.Fatalf("dst v1 payload = %+v, want placeholder with _reason=source_version_unavailable", gotPayload)
+			}
+			if _, hasValue := gotPayload["value"]; hasValue {
+				t.Fatalf("dst v1 payload = %+v, still carries the real source value -- placeholder was not written", gotPayload)
+			}
+
+			if versionStates != nil {
+				if got := versionStates["1"]; got != "deleted" {
+					t.Fatalf("VersionStates[\"1\"] = %q, want \"deleted\" (must not regress to read_error)", got)
+				}
+			}
+
+			dstMeta, err := m.kv2ReadMetadata(context.Background(), m.Dst, "app/softdel")
+			if err != nil {
+				t.Fatalf("kv2ReadMetadata dst failed: %v", err)
+			}
+			if dstMeta.Data.Versions["1"].DeletionTime == "" {
+				t.Fatalf("dst v1 should be marked deleted to mirror the source")
+			}
+		})
+	}
+}
+
+// TestKV2ReadVersion_FutureDeletionTimeStillReadsRealData is the regression
+// test for B18's critical warning: a version with a FUTURE-dated
+// deletion_time (set via `delete_version_after`, not yet reaped by Vault)
+// is still fully readable with real data. The fix must key off the read
+// itself returning nil data, never off DeletionTime != "" alone -- keying
+// off the metadata field would cause genuine loss of live, currently
+// accessible data.
+func TestKV2ReadVersion_FutureDeletionTimeStillReadsRealData(t *testing.T) {
+	src := newFakeVault(t)
+	dst := newFakeVault(t)
+
+	src.putVersion("app/scheduled", map[string]any{"value": "still-here"})
+	src.markVersionDeletionScheduled("app/scheduled", 1, time.Now().Add(24*time.Hour))
+
+	m := newTestMigrator(t, src, dst, false)
+
+	payload, err := m.kv2ReadVersion(context.Background(), m.Src, "app/scheduled", 1)
+	if err != nil {
+		t.Fatalf("kv2ReadVersion on a future-scheduled (still readable) version failed: %v", err)
+	}
+	if payload["value"] != "still-here" {
+		t.Fatalf("payload = %+v, want real data {value: still-here}, not a placeholder", payload)
+	}
+}
+
+// TestCopySecretFull_FutureDeletionTimeCopiesRealData is
+// TestKV2ReadVersion_FutureDeletionTimeStillReadsRealData at the copy-path
+// level: copySecretFull must write the version's REAL data to the
+// destination, not a placeholder, and label it "active" (not "deleted") --
+// the deadline hasn't passed, so nothing has actually been soft-deleted yet.
+func TestCopySecretFull_FutureDeletionTimeCopiesRealData(t *testing.T) {
+	src := newFakeVault(t)
+	dst := newFakeVault(t)
+
+	src.putVersion("app/scheduled", map[string]any{"value": "still-here"})
+	src.markVersionDeletionScheduled("app/scheduled", 1, time.Now().Add(24*time.Hour))
+	m := newTestMigrator(t, src, dst, true)
+
+	srcMeta, err := m.kv2ReadMetadata(context.Background(), m.Src, "app/scheduled")
+	if err != nil {
+		t.Fatalf("kv2ReadMetadata src failed: %v", err)
+	}
+
+	if err := m.copySecretFull(context.Background(), "app/scheduled", "app/scheduled", srcMeta, Options{
+		Placeholder: map[string]any{"_vault_migrate": "placeholder", "_reason": "source_version_unavailable"},
+	}); err != nil {
+		t.Fatalf("copySecretFull failed: %v", err)
+	}
+
+	v1, err := m.kv2ReadVersion(context.Background(), m.Dst, "app/scheduled", 1)
+	if err != nil {
+		t.Fatalf("read dst v1 failed: %v", err)
+	}
+	if v1["value"] != "still-here" {
+		t.Fatalf("dst v1 = %+v, want real data {value: still-here}, got a placeholder instead", v1)
+	}
+
+	secretState := m.State.GetSecret("app/scheduled")
+	if secretState == nil {
+		t.Fatalf("expected state for app/scheduled")
+	}
+	if got := secretState.VersionStates["1"]; got != "active" {
+		t.Fatalf("VersionStates[\"1\"] = %q, want \"active\" (deadline has not passed, data was actually copied)", got)
+	}
+}
+
+// TestCopyOneSecretWithState_SoftDeletedVersionIsIdempotent locks B18's fix
+// against the exact failure mode the pruning bug had earlier this session:
+// a soft-deleted source version must not, on a second run over an already
+// migrated secret, trigger a destination delete+recopy. Verified via the
+// fake's deleteCalls() counter, which must stay at 0 across both runs.
+func TestCopyOneSecretWithState_SoftDeletedVersionIsIdempotent(t *testing.T) {
+	src := newFakeVault(t)
+	dst := newFakeVault(t)
+
+	src.putVersion("app/softdel", map[string]any{"value": "v1"})
+	src.putVersion("app/softdel", map[string]any{"value": "v2"})
+	src.markVersionDeleted("app/softdel", 1)
+
+	m := newTestMigrator(t, src, dst, true)
+	opts := Options{Placeholder: map[string]any{"_vault_migrate": "placeholder", "_reason": "source_version_unavailable"}}
+
+	if err := m.copyOneSecretWithState(context.Background(), "app/softdel", "app/softdel", opts); err != nil {
+		t.Fatalf("first copyOneSecretWithState run failed: %v", err)
+	}
+	if got := dst.deleteCalls(); got != 0 {
+		t.Fatalf("deleteCalls after first run = %d, want 0", got)
+	}
+
+	if err := m.copyOneSecretWithState(context.Background(), "app/softdel", "app/softdel", opts); err != nil {
+		t.Fatalf("second (idempotent) copyOneSecretWithState run failed: %v", err)
+	}
+	if got := dst.deleteCalls(); got != 0 {
+		t.Fatalf("deleteCalls after idempotent re-run = %d, want 0 (soft-deleted version must not trigger delete+recopy)", got)
 	}
 }
 
