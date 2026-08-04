@@ -96,6 +96,13 @@ git push origin v1.0.0
 Tags that are not reachable from `main` fail release validation.
 
 
+## CI
+
+Two workflows exist:
+
+- **`.github/workflows/ci.yml`** — PR/push CI. Triggers on every pull request and every push to `main`. Runs `go test -coverprofile=coverage.out -covermode=atomic ./...` across a matrix of Go 1.25.x and 1.26.x, enforces a **73% total-coverage floor** (gate fails below this; measured baseline is 76.3%), and uploads `coverage.out` + `coverage.html` as artifacts on every run (even if the gate fails). E2E tests self-skip when `E2E_TESTS=1` is not set, so they don't run under this workflow.
+- **`.github/workflows/release-build.yml`** — Release gate. Triggers only on `v*` tag push. Validates the tag, runs tests, builds multi-platform binaries with GoReleaser, attests and publishes release assets.
+
 ## Test
 
 Test conventions:
