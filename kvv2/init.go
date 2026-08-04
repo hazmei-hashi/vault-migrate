@@ -36,11 +36,14 @@ type Options struct {
 // promptMount reads a KV v2 mount until it is non-empty AFTER slash
 // normalization. Validating before normalization lets "/" or "///" through as
 // "non-empty" input that normalizes to an empty mount, producing "/metadata/..."
-// requests that 404, get swallowed by isNotFound, and exit 0 as a "completed"
-// no-op migration - the same silent no-op this fix set out to kill.
+// requests against the root of the mount and silently migrating (or finding
+// nothing under) the wrong path - the same silent no-op this fix set out to
+// kill. (See also B9's 0-keys guard in Run, which now catches empty results
+// from this class of mistake at the Run level too.)
 //
-// ponytail: strings.Trim locally, not trimSlashes - trimSlashes strips only one
-// slash per side (B16), so it would still pass "///" through as "/".
+// ponytail: strings.Trim locally rather than calling trimSlashes - same
+// behavior today (both strip all leading/trailing slashes), kept local to
+// avoid coupling this loop to trimSlashes's exact semantics.
 func promptMount(label string) (string, error) {
 	for {
 		v, err := config.PromptRequired(label)
@@ -183,6 +186,20 @@ func (m *Migrator) Run(ctx context.Context, opts Options) error {
 	keys, err := m.walkAllKeys(ctx, m.Src, trimSlashes(m.Src.BasePath))
 	if err != nil {
 		return err
+	}
+
+	// B9: a missing mount, a KV v1 mount (LIST 400 "unsupported path"), a
+	// typo'd mount name, and a typo'd base path all land here as "0 keys" --
+	// Vault's SDK gives walkAllKeys no way to distinguish any of them from a
+	// genuinely empty mount (an absent LIST prefix and a 400 both eventually
+	// resolve to "no keys" once list errors that ARE genuine, per Task 2,
+	// have already been ruled out above). Exiting 0 here would report a
+	// "successful" migration that copied nothing, which is worse than
+	// erroring: it hides the mistake instead of surfacing it. This requires
+	// no permission beyond the `list` on `<mount>/metadata/*` the README
+	// already grants -- no sys/mounts preflight needed.
+	if len(keys) == 0 {
+		return fmt.Errorf("no secrets found under %q on source mount %q: refusing to report success", m.Src.BasePath, m.Src.MountPath)
 	}
 
 	m.Logger.Info("Starting migration", "total_secrets", len(keys), "dry_run", opts.DryRun)

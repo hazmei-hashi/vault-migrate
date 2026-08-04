@@ -102,7 +102,22 @@ Test conventions:
 - Table-driven tests (`tests := []struct{...}` + `t.Run` subtests) throughout.
 - `kvv2/kvv2_mock_test.go` provides `newFakeVault` — an `httptest.Server`-backed
   fake KV v2 backend used by all `kvv2` package unit tests instead of a real
-  Vault cluster.
+  Vault cluster. It models real Vault's 404-with-data response shape for
+  reads against deleted/destroyed versions, per-secret and mount-level
+  `max_versions` sliding-window pruning, per-secret and mount-level
+  `cas_required` enforcement on data writes (rejecting a write with no
+  `options.cas` as `400 check-and-set parameter required for this call`,
+  and rejecting a wrong `options.cas` VALUE — not merely its presence — as
+  `400 check-and-set parameter did not match the current version`,
+  mirroring `path_data.go:283-288`'s unconditional value check), and
+  injectable LIST errors, plus a `deleteCalls()` counter used to assert
+  idempotency (no destination delete+recopy) across repeated migration
+  runs.
+- `client/client_test.go` provides a matching `httptest.Server`-backed fake for
+  `sys/health` and `auth/token/lookup-self`, covering every `getClient` error
+  path (unreachable address, health 5xx, uninitialized, sealed, lookup
+  failure) plus regression locks for namespace-before-lookup, max retries, and
+  client timeout.
 - Stdin-driven prompts (`Init`, `config.Prompt`/`PromptRequired`) are tested via
   a `useStdinInput(t, input)` helper that swaps `os.Stdin` for a pipe pre-loaded
   with the given input and restores it on cleanup.
@@ -181,19 +196,24 @@ Minimal command:
 
 ### Prompt Order
 
-Any value not supplied via flag is prompted for, in this exact order (skipping entries already set by flag):
+`-srcAddr` and `-dstAddr` are **not actually prompted** despite `client.BuildClients`
+containing prompt branches for both: `cmd.validateConfig` fatals before
+`BuildClients` ever runs if either is empty, so those two branches are dead
+code on the `cmd` entrypoint (kept as a library-safe fallback for callers
+that skip `validateConfig` — see `client/client.go`). Pass both as flags.
 
-1. Source Vault API address
-2. Source Vault token (hidden input)
-3. Source namespace (empty = root namespace)
-4. Destination Vault API address
-5. Destination Vault token (hidden input)
-6. Destination namespace (empty = root namespace)
-7. Skip TLS verification? (y/n)
-8. Source KV-V2 mount (required; re-prompts on empty or slash-only input)
-9. Source KV-V2 base path (empty = root path, legal)
-10. Destination KV-V2 mount (required; re-prompts on empty or slash-only input)
-11. Destination KV-V2 base path (empty = root path, legal)
+Any other value not supplied via flag is prompted for, in this exact order
+(skipping entries already set by flag):
+
+1. Source Vault token (hidden input)
+2. Source namespace (empty = root namespace)
+3. Destination Vault token (hidden input)
+4. Destination namespace (empty = root namespace)
+5. Skip TLS verification? (y/n)
+6. Source KV-V2 mount (required; re-prompts on empty or slash-only input)
+7. Source KV-V2 base path (empty = root path, legal)
+8. Destination KV-V2 mount (required; re-prompts on empty or slash-only input)
+9. Destination KV-V2 base path (empty = root path, legal)
 
 Tokens are read via `term.ReadPassword` and require a real TTY (no echo, no
 paste-safe fallback). In CI or any non-interactive environment, pass
@@ -222,7 +242,8 @@ The CLI supports these flags:
 | `-stateFile` | `.vault-migrate-state.json` | Path to migration state file |
 | `-noState` | `false` | Disable state tracking |
 | `-forceRecopy` | `false` | Re-copy when state indicates hashes already match |
-| `-maxRetries` | `3` | Validated as `>= 0` at startup, but currently has no effect on migration behavior (no retry loop reads it yet) |
+| `-maxRetries` | `3` | Validated as `>= 0` at startup; wired into the Vault API client's HTTP-level retry policy (`SetMaxRetries` + `retryablehttp.RateLimitLinearJitterBackoff`), so failed/idempotent requests are retried up to this many times, honoring a server's `Retry-After` header on `429`/`503` responses. No app-level per-secret retry loop exists — retries happen only at the HTTP transport layer, below `copyOneSecret` |
+| `-clientTimeout` | `60s` | Validated as `> 0` at startup; HTTP client timeout for Vault API requests (`SetClientTimeout`) |
 | `-continueOnError` | `false` | Continue migration after per-secret copy errors |
 | `-dryRun` | `false` | Show what would be copied without writing to the destination |
 
@@ -235,8 +256,9 @@ If a flag is omitted, the tool prompts for the missing value at runtime, in the 
 State file stores:
 - Per-secret status (`completed`, `recreated`, `failed`, `skipped`)
 - Version hashes (SHA256)
-- Version state (`active`, `deleted`, `destroyed`, `missing`, `read_error`)
+- Version state (`active`, `deleted`, `destroyed`, `missing`, `read_error`) — `deleted` is set when the source version is confirmed genuinely soft-deleted by an actual failed read (Vault's 404-with-data response for that version), never merely because a `deletion_time` field is present: a future-dated `deletion_time` from `delete_version_after` is non-empty while the version is still fully readable, and that case reads real data and is labeled `active`.
 - Metadata checksum
+- Source and destination version counts — the destination count is **measured** from an actual destination metadata read after copy, not assumed equal to the source count, so it stays accurate even when destination `max_versions` retention prunes below what was written. If that measurement read itself fails, the count falls back to the assumed (source) value and the failure is logged at debug — this bookkeeping never aborts the migration.
 - Summary counters
 
 Per-secret behavior:
@@ -247,15 +269,19 @@ Per-secret behavior:
 2. Destination and source have same max version
 - If existing state has version hashes and `-forceRecopy=false`, tool can skip.
 - If no hash state, tool compares source/destination payload hashes.
-- On mismatch, destination secret metadata path is deleted, then full copy runs.
+- A source version already pruned from the destination's own metadata (by destination `max_versions`) is skipped during comparison, not treated as a mismatch — this avoids a destructive delete-and-recopy loop that would otherwise repeat on every run.
+- On genuine mismatch, destination secret metadata path is deleted, then full copy runs.
 
 3. Destination has fewer versions than source
 - Tool copies only missing tail versions (`dstMax+1..srcMax`).
+- Destination retention governs history depth: if destination `max_versions` is lower than the source version count, only the newest N versions persist there regardless of how many were copied — this is the destination's own KV v2 engine honoring its configured retention, not a migration bug.
 
 4. Destination has more versions than source
 - Secret marked failed.
 - Migration returns error for that secret.
 - With `-continueOnError`, migration continues to next secret.
+
+After any full or incremental copy (cases 1, 2, and 3), if the destination's measured version count ends up lower than the source count just copied, a `Logger.Warn` names the secret key and both the source and measured destination version counts. This is a warning only — the migration does not fail and does not retry: the latest value is written last and always survives destination retention, so only older history is affected.
 
 ### Legacy Mode (`-noState=true`)
 
@@ -273,9 +299,14 @@ Per-secret behavior:
 - KV v2 mode only (`-mode kvv2`).
 - Source version timestamps are not preserved on destination.
 - Destroyed source payloads are unrecoverable; tool writes placeholder then marks destination version destroyed.
+- Soft-deleted source payloads are also unrecoverable at read time (Vault returns no data for them); the tool writes the configured placeholder then marks the destination version deleted to match, instead of writing an empty/null payload.
+- A transient read failure (5xx, timeout, permission error) on a source version also writes the placeholder to the destination, but does NOT mirror a soft-delete — the destination version stays readable. State labels the version `read_error`. Only a genuine Vault soft-delete sentinel (`errVersionDataUnavailable`, i.e. Vault's 404-with-data shape for a deleted/destroyed version) causes the destination delete to be mirrored.
 - Token renewal is not handled; token TTL must exceed migration duration.
 - State file is single-writer; do not share one `-stateFile` across parallel migrations.
-- Vault client timeout is 3 seconds per request.
+- State file writes are atomic against a killed process (temp file in the same directory + `os.Rename`), but NOT against power loss — there is no `fsync` before the rename, so a hard crash at the wrong instant can still leave a lost (not corrupted) write on some filesystems.
+- Vault client timeout is configurable via `-clientTimeout` (default 60s per request).
+- A source mount/base path that resolves to zero secrets (missing mount, KV v1 mount, typo'd mount or base path) makes the migration fail rather than report success; the SDK cannot distinguish those cases from a genuinely empty mount.
+- Migrating into a `cas_required` destination is supported via a reactive check-and-set retry: `kv2WriteData` sends the same request as always (no `options.cas`) on the first attempt. If — and only if — that write is rejected with `400 check-and-set parameter required for this call` (destination mount tunable OR destination secret's own `cas_required`), it reads the destination's current version via `<mount>/metadata/*` and retries exactly once with `options.cas` set to that version. On every other destination (the overwhelming majority of real runs) this is byte-identical to the pre-existing wire format — no extra request, no `options` key on the write at all. The one-time extra round trip only happens on a `cas_required` destination, and only after the first write already failed. A genuine concurrent-writer CAS mismatch on the retry is not looped — it propagates as a loud failure, same as any other write error. Requires no new token permission: destination `read` on `<mount>/metadata/*` was already required (see Token Policy Requirements above). Verified against a real Vault cluster (`test/e2e/e2e_test.go`'s `TestE2E_CASRequiredMountDestination`, `TestE2E_CASRequiredPerSecretDestination`, `TestE2E_SourceCASRequiredIncremental`), in addition to mock coverage.
 
 ## Security Notes
 

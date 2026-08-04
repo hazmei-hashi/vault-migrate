@@ -120,6 +120,54 @@ func TestMigrationState_Save_Load(t *testing.T) {
 	}
 }
 
+func TestMigrationState_Save_Atomic(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "state.json")
+
+	src := ClusterInfo{Address: "https://src:8200", Namespace: "admin", Mount: "secret", BasePath: "app"}
+	dst := ClusterInfo{Address: "https://dst:8200", Namespace: "admin", Mount: "secret", BasePath: "app2"}
+
+	// Pre-existing valid state file.
+	first := NewMigrationState(src, dst)
+	first.UpdateSecret("secret/old", &Secret{Status: "completed"})
+	if err := first.Save(path); err != nil {
+		t.Fatalf("Save() first error = %v", err)
+	}
+
+	// Save again over the existing file.
+	second := NewMigrationState(src, dst)
+	second.UpdateSecret("secret/new", &Secret{Status: "completed"})
+	if err := second.Save(path); err != nil {
+		t.Fatalf("Save() second error = %v", err)
+	}
+
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if loaded == nil {
+		t.Fatal("Load() returned nil")
+	}
+	if _, ok := loaded.Secrets["secret/new"]; !ok {
+		t.Errorf("Load() Secrets missing %q, got %+v", "secret/new", loaded.Secrets)
+	}
+	if _, ok := loaded.Secrets["secret/old"]; ok {
+		t.Errorf("Load() Secrets should not contain stale %q", "secret/old")
+	}
+
+	entries, err := os.ReadDir(tmpDir)
+	if err != nil {
+		t.Fatalf("ReadDir() error = %v", err)
+	}
+	if len(entries) != 1 {
+		names := make([]string, len(entries))
+		for i, e := range entries {
+			names[i] = e.Name()
+		}
+		t.Errorf("ReadDir() entries = %d, want 1 (leaked temp file?); got %v", len(entries), names)
+	}
+}
+
 func TestLoad_NotExist(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "nonexistent.json")

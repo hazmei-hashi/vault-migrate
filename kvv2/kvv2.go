@@ -12,9 +12,24 @@ import (
 )
 
 // errMetadataNotFound sentinels Vault's nil/nil "empty metadata" shape (see
-// kv2ReadMetadata) so isNotFound can match it structurally instead of relying
-// solely on the "not found" substring baked into the wrapped message below.
+// kv2ReadMetadata) so isMetadataNotFound can match it structurally instead of
+// relying on message text.
 var errMetadataNotFound = errors.New("metadata not found")
+
+// errVersionDataUnavailable sentinels Vault's 404-with-data shape for a
+// soft-deleted version read (see kv2ReadVersion). Real Vault returns HTTP
+// 404 WITH a "data" body (`{"data":{"data":null,"metadata":{...}}}`, no
+// "errors") for that case; the Vault SDK reports it as SUCCESS
+// (api/secret.go's DeepEqual check skips the errors branch, api/logical.go
+// returns (secret, nil) because len(Data) > 0), so a naive caller sees
+// rerr == nil with a nil payload. B18: without this sentinel, all three copy
+// paths skipped the opts.Placeholder branch entirely and wrote
+// {"data": null} to the destination instead of the configured placeholder.
+// Do NOT key this off metadata.DeletionTime alone -- a future-dated
+// deletion_time (delete_version_after) is non-empty while the version is
+// STILL READABLE with real data; only a nil out.Data.Data means the read
+// actually failed to produce a payload.
+var errVersionDataUnavailable = errors.New("source version data unavailable (soft-deleted or destroyed)")
 
 // walkAllKeys returns leaf secret keys relative to the mount
 func (m *Migrator) walkAllKeys(ctx context.Context, c KVV2Cluster, startPrefix string) ([]string, error) {
@@ -27,11 +42,16 @@ func (m *Migrator) walkAllKeys(ctx context.Context, c KVV2Cluster, startPrefix s
 	rec = func(prefix string) error {
 		keys, err := m.kv2List(ctx, c, prefix)
 		if err != nil {
-			// Treat missing prefix as empty.
-			if isNotFound(err) {
-				return nil
-			}
-			return err
+			// kv2List already returns (nil, nil) for a genuinely absent
+			// prefix (see its sec == nil / sec.Data == nil check below), so
+			// any error reaching here is real: 403 permission denied, 400
+			// "unsupported path" (e.g. a KV v1 mount), 5xx, or a timeout.
+			// Previously this branch treated ALL such errors as "missing
+			// subtree" and returned nil, which silently dropped every
+			// secret beneath prefix from the walk while the overall Run
+			// still exited 0 as a successful migration -- B17's highest-
+			// value fix.
+			return fmt.Errorf("list %q: %w", prefix, err)
 		}
 
 		for _, k := range keys {
@@ -155,12 +175,18 @@ func (m *Migrator) copyOneSecret(ctx context.Context, srcKey, dstKey string, opt
 		}
 
 		var payload map[string]any
+		var readFailed bool
 		if vm.Destroyed {
 			payload = opts.Placeholder
 		} else {
 			p, rerr := m.kv2ReadVersion(ctx, m.Src, srcKey, v)
 			if rerr != nil {
 				payload = opts.Placeholder
+				// Gate readFailed on the sentinel: only a genuine soft-delete
+				// (errVersionDataUnavailable) should mirror a delete onto the
+				// destination. A transient error (5xx, timeout, perms) leaves
+				// the placeholder written above intact -- no delete mirrored.
+				readFailed = errors.Is(rerr, errVersionDataUnavailable)
 			} else {
 				payload = p
 			}
@@ -175,7 +201,15 @@ func (m *Migrator) copyOneSecret(ctx context.Context, srcKey, dstKey string, opt
 			if err := m.kv2DestroyVersions(ctx, m.Dst, dstKey, []int{v}); err != nil {
 				return fmt.Errorf("destroy dst v=%d: %w", v, err)
 			}
-		} else if vm.DeletionTime != "" {
+		} else if readFailed {
+			// B18: only mirror a delete onto the destination when the
+			// source read actually failed to produce data (soft-deleted,
+			// errVersionDataUnavailable). vm.DeletionTime != "" alone is
+			// NOT sufficient -- a future-dated delete_version_after sets
+			// this field while the version is still fully readable, and
+			// the branch above just wrote its REAL data to the
+			// destination; soft-deleting it here would destroy live data
+			// that was correctly copied one line earlier.
 			if err := m.kv2DeleteVersions(ctx, m.Dst, dstKey, []int{v}); err != nil {
 				return fmt.Errorf("delete dst v=%d: %w", v, err)
 			}
@@ -221,7 +255,7 @@ func (m *Migrator) copyOneSecretWithState(ctx context.Context, srcKey, dstKey st
 
 	dstMeta, err := m.kv2ReadMetadata(ctx, m.Dst, dstKey)
 	destExists := err == nil
-	if err != nil && !isNotFound(err) {
+	if err != nil && !isMetadataNotFound(err) {
 		return fmt.Errorf("read destination metadata: %w", err)
 	}
 
@@ -254,7 +288,7 @@ func (m *Migrator) copyOneSecretWithState(ctx context.Context, srcKey, dstKey st
 			} else {
 				// No state or no hashes - need to verify by reading actual data
 				m.Logger.Debug("Verifying destination secret (no state)", "secret", srcKey)
-				allMatch, err := m.verifyDestinationMatches(ctx, srcKey, dstKey, srcMeta)
+				allMatch, err := m.verifyDestinationMatches(ctx, srcKey, dstKey, srcMeta, dstMeta)
 				if err != nil {
 					m.Logger.Warn("Failed to verify destination", "secret", srcKey, "err", err)
 					// On verification error, recreate to be safe
@@ -329,6 +363,7 @@ func (m *Migrator) copySecretFull(ctx context.Context, srcKey, dstKey string, sr
 
 		var payload map[string]any
 		var versionState string
+		var readFailed bool
 
 		if vm.Destroyed {
 			payload = opts.Placeholder
@@ -337,14 +372,28 @@ func (m *Migrator) copySecretFull(ctx context.Context, srcKey, dstKey string, sr
 			p, rerr := m.kv2ReadVersion(ctx, m.Src, srcKey, v)
 			if rerr != nil {
 				payload = opts.Placeholder
-				versionState = "read_error"
-			} else {
-				payload = p
-				if vm.DeletionTime != "" {
+				// Gate readFailed on the sentinel: only a genuine soft-delete
+				// (errVersionDataUnavailable) mirrors a delete onto the
+				// destination. Transient errors keep the placeholder readable.
+				readFailed = errors.Is(rerr, errVersionDataUnavailable)
+				// B18: errVersionDataUnavailable is Vault's own signal
+				// that this version is genuinely soft-deleted (whatever
+				// triggered it -- an explicit delete, or a past
+				// delete_version_after deadline). Any other error is a
+				// real read failure (network, 5xx, etc.), not a delete.
+				if errors.Is(rerr, errVersionDataUnavailable) {
 					versionState = "deleted"
 				} else {
-					versionState = "active"
+					versionState = "read_error"
 				}
+			} else {
+				// B18 CRITICAL: the read succeeded with real data, so
+				// this version is live REGARDLESS of vm.DeletionTime --
+				// a future-dated delete_version_after sets that field
+				// while the version stays fully readable. Never key off
+				// DeletionTime here; the read outcome is authoritative.
+				payload = p
+				versionState = "active"
 
 				hash, err := state.HashPayload(payload)
 				if err != nil {
@@ -366,7 +415,10 @@ func (m *Migrator) copySecretFull(ctx context.Context, srcKey, dstKey string, sr
 			if err := m.kv2DestroyVersions(ctx, m.Dst, dstKey, []int{v}); err != nil {
 				return fmt.Errorf("destroy dst v=%d: %w", v, err)
 			}
-		} else if vm.DeletionTime != "" {
+		} else if readFailed {
+			// B18: only mirror a delete onto the destination when the
+			// source read actually failed to produce data. Do NOT use
+			// vm.DeletionTime != "" here -- see the comment above.
 			if err := m.kv2DeleteVersions(ctx, m.Dst, dstKey, []int{v}); err != nil {
 				return fmt.Errorf("delete dst v=%d: %w", v, err)
 			}
@@ -388,10 +440,13 @@ func (m *Migrator) copySecretFull(ctx context.Context, srcKey, dstKey string, sr
 	}
 
 	if m.State != nil {
+		destCount := m.measureDestVersionCount(ctx, dstKey, maxV)
+		m.warnDestTruncated(srcKey, maxV, destCount)
+
 		secretState := &state.Secret{
 			Status:             "completed",
 			SourceVersionCount: maxV,
-			DestVersionCount:   maxV,
+			DestVersionCount:   destCount,
 			VersionHashes:      versionHashes,
 			VersionStates:      versionStates,
 			MetadataChecksum:   metaChecksum,
@@ -439,6 +494,7 @@ func (m *Migrator) copyIncrementalVersions(ctx context.Context, srcKey, dstKey s
 
 		var payload map[string]any
 		var versionState string
+		var readFailed bool
 
 		if vm.Destroyed {
 			payload = opts.Placeholder
@@ -447,14 +503,24 @@ func (m *Migrator) copyIncrementalVersions(ctx context.Context, srcKey, dstKey s
 			p, rerr := m.kv2ReadVersion(ctx, m.Src, srcKey, v)
 			if rerr != nil {
 				payload = opts.Placeholder
-				versionState = "read_error"
-			} else {
-				payload = p
-				if vm.DeletionTime != "" {
+				// Gate readFailed on the sentinel: only a genuine soft-delete
+				// (errVersionDataUnavailable) mirrors a delete onto the
+				// destination. Transient errors keep the placeholder readable.
+				readFailed = errors.Is(rerr, errVersionDataUnavailable)
+				// B18: see copySecretFull -- errVersionDataUnavailable is
+				// Vault's own signal this version is genuinely
+				// soft-deleted; any other error is a real read failure.
+				if errors.Is(rerr, errVersionDataUnavailable) {
 					versionState = "deleted"
 				} else {
-					versionState = "active"
+					versionState = "read_error"
 				}
+			} else {
+				// B18 CRITICAL: read succeeded with real data -> live
+				// regardless of vm.DeletionTime (future-dated
+				// delete_version_after). Never key off DeletionTime here.
+				payload = p
+				versionState = "active"
 
 				hash, err := state.HashPayload(payload)
 				if err != nil {
@@ -476,7 +542,9 @@ func (m *Migrator) copyIncrementalVersions(ctx context.Context, srcKey, dstKey s
 			if err := m.kv2DestroyVersions(ctx, m.Dst, dstKey, []int{v}); err != nil {
 				return fmt.Errorf("destroy dst v=%d: %w", v, err)
 			}
-		} else if vm.DeletionTime != "" {
+		} else if readFailed {
+			// B18: only mirror a delete when the source read actually
+			// failed to produce data. Do NOT use vm.DeletionTime != "".
 			if err := m.kv2DeleteVersions(ctx, m.Dst, dstKey, []int{v}); err != nil {
 				return fmt.Errorf("delete dst v=%d: %w", v, err)
 			}
@@ -498,10 +566,13 @@ func (m *Migrator) copyIncrementalVersions(ctx context.Context, srcKey, dstKey s
 	}
 
 	if m.State != nil {
+		destCount := m.measureDestVersionCount(ctx, dstKey, endVersion)
+		m.warnDestTruncated(srcKey, endVersion, destCount)
+
 		secretState := &state.Secret{
 			Status:             "completed",
 			SourceVersionCount: endVersion,
-			DestVersionCount:   endVersion,
+			DestVersionCount:   destCount,
 			VersionHashes:      versionHashes,
 			VersionStates:      versionStates,
 			MetadataChecksum:   metaChecksum,
@@ -526,6 +597,32 @@ func getMaxVersion(meta *kv2MetadataResp) int {
 	return maxV
 }
 
+// measureDestVersionCount reads back the destination's actual metadata to
+// count versions really persisted there, since destination-side
+// max_versions retention can silently prune below the count assumed at
+// write time. Bookkeeping only: a read failure must never abort the
+// migration, so it logs at debug and falls back to assumed.
+func (m *Migrator) measureDestVersionCount(ctx context.Context, dstKey string, assumed int) int {
+	dstMeta, err := m.kv2ReadMetadata(ctx, m.Dst, dstKey)
+	if err != nil {
+		m.Logger.Debug("measure destination version count failed, using assumed value",
+			"secret", dstKey, "assumed", assumed, "err", err)
+		return assumed
+	}
+	return len(dstMeta.Data.Versions)
+}
+
+// warnDestTruncated logs when destination retention kept fewer versions
+// than the source had. This is the destination honoring its own configured
+// max_versions -- expected, not an error -- so it only warns; it never
+// fails or retries.
+func (m *Migrator) warnDestTruncated(srcKey string, srcCount, destCount int) {
+	if destCount < srcCount {
+		m.Logger.Warn("destination retention truncated version history",
+			"secret", srcKey, "source_versions", srcCount, "dest_versions", destCount)
+	}
+}
+
 func (m *Migrator) verifyVersionHashes(ctx context.Context, srcKey, dstKey string, srcMeta *kv2MetadataResp, existingState *state.Secret) (bool, error) {
 	if existingState == nil || existingState.VersionHashes == nil {
 		return false, nil
@@ -546,6 +643,16 @@ func (m *Migrator) verifyVersionHashes(ctx context.Context, srcKey, dstKey strin
 
 		payload, err := m.kv2ReadVersion(ctx, m.Src, srcKey, v)
 		if err != nil {
+			if errors.Is(err, errVersionDataUnavailable) {
+				// B18: source version metadata says it exists but the
+				// actual read comes back with no payload (soft-deleted,
+				// 404-with-data). There is no real data to hash and
+				// compare, and treating this as a mismatch would send
+				// the caller down the delete+recopy path, which just
+				// reproduces the identical soft-deleted state every run.
+				// Skip instead of failing the comparison over it.
+				continue
+			}
 			return false, fmt.Errorf("read version %d: %w", v, err)
 		}
 
@@ -562,7 +669,7 @@ func (m *Migrator) verifyVersionHashes(ctx context.Context, srcKey, dstKey strin
 	return true, nil
 }
 
-func (m *Migrator) verifyDestinationMatches(ctx context.Context, srcKey, dstKey string, srcMeta *kv2MetadataResp) (bool, error) {
+func (m *Migrator) verifyDestinationMatches(ctx context.Context, srcKey, dstKey string, srcMeta, dstMeta *kv2MetadataResp) (bool, error) {
 	maxV := getMaxVersion(srcMeta)
 
 	for v := 1; v <= maxV; v++ {
@@ -571,13 +678,39 @@ func (m *Migrator) verifyDestinationMatches(ctx context.Context, srcKey, dstKey 
 			continue
 		}
 
+		if _, destHas := dstMeta.Data.Versions[strconv.Itoa(v)]; !destHas {
+			// Version was pruned away by the destination's own retention
+			// window (max_versions) -- e.g. dest max_versions=3 but the
+			// source has 5 readable versions. This is NOT a genuine
+			// mismatch: the version simply no longer exists to compare.
+			// Erroring here (as this used to) sent copyOneSecretWithState
+			// down the delete+recopy path (kvv2.go verifyDestinationMatches
+			// caller), which immediately re-prunes back to the identical
+			// state -- a destructive, non-idempotent loop that repeats
+			// EVERY run. Skip the version instead of failing the
+			// comparison over it.
+			continue
+		}
+
 		srcPayload, err := m.kv2ReadVersion(ctx, m.Src, srcKey, v)
 		if err != nil {
+			if errors.Is(err, errVersionDataUnavailable) {
+				// B18: same as verifyVersionHashes -- a soft-deleted
+				// source version with no readable payload cannot be
+				// compared and must not trigger a delete+recopy loop.
+				continue
+			}
 			return false, fmt.Errorf("read source version %d: %w", v, err)
 		}
 
 		dstPayload, err := m.kv2ReadVersion(ctx, m.Dst, dstKey, v)
 		if err != nil {
+			if errors.Is(err, errVersionDataUnavailable) {
+				// Destination version was written as a placeholder then
+				// soft-deleted to mirror the source (B18's own fix path)
+				// -- also unreadable, also not a genuine mismatch.
+				continue
+			}
 			return false, fmt.Errorf("read destination version %d: %w", v, err)
 		}
 
@@ -622,9 +755,9 @@ func (m *Migrator) kv2ReadMetadata(ctx context.Context, c KVV2Cluster, relKey st
 	if sec == nil || sec.Data == nil {
 		// Vault's Read() collapses a bare 404 (no warnings/data) into
 		// (nil, nil) rather than an error. Surface it as a "not found"
-		// so callers using isNotFound (e.g. destination-exists checks)
-		// treat a missing secret the same whether the API returned an
-		// explicit 404 error or this nil/nil shape.
+		// so callers using isMetadataNotFound (e.g. destination-exists
+		// checks) treat a missing secret the same whether the API returned
+		// an explicit 404 error or this nil/nil shape.
 		return nil, fmt.Errorf("%w: empty metadata response for %q", errMetadataNotFound, path)
 	}
 
@@ -658,9 +791,24 @@ func (m *Migrator) kv2ReadVersion(ctx context.Context, c KVV2Cluster, relKey str
 	if err := mapToStruct(wrapped, &out); err != nil {
 		return nil, err
 	}
+	if out.Data.Data == nil {
+		// B18: this is Vault's 404-with-data shape for a soft-deleted
+		// version -- the SDK treated it as a success response (see
+		// errVersionDataUnavailable doc comment), but there is no actual
+		// payload to return. Surface it as an error so every caller's
+		// existing `if rerr != nil` placeholder branch fires naturally,
+		// instead of writing a nil payload to the destination.
+		return nil, errVersionDataUnavailable
+	}
 	return out.Data.Data, nil
 }
 
+// kv2WriteData writes a KV v2 version. B19: on the common path (no
+// cas_required anywhere) this is byte-identical to the pre-B19 request --
+// one write, no "options" key, no extra round trip. Only a destination that
+// actually requires check-and-set (mount-level OR per-secret
+// cas_required, path_data.go:278-288) diverts into the retry below, and
+// only after the first write has already failed with that exact error.
 func (m *Migrator) kv2WriteData(ctx context.Context, c KVV2Cluster, relKey string, data map[string]any) error {
 
 	m.Logger.Debug("WRITE", "kvv2-secret", relKey)
@@ -670,6 +818,69 @@ func (m *Migrator) kv2WriteData(ctx context.Context, c KVV2Cluster, relKey strin
 	_, err := c.Client.Logical().WriteWithContext(ctx, path, map[string]any{
 		"data": data,
 	})
+	if err == nil {
+		return nil
+	}
+	if !isCASRequiredError(err) {
+		return err
+	}
+
+	// --- only reachable on a cas_required destination (mount or secret) ---
+	//
+	// ponytail: no cas threaded through call sites, no version counter
+	// kept on Migrator -- the write response and metadata current_version
+	// are authoritative on demand, read reactively only when a write
+	// actually needs it. A cached counter would need seeding on every path
+	// that can create/advance a destination version (this write, delete,
+	// destroy, and the pre-existing dest-ahead branch in
+	// copyOneSecretWithState) plus invalidation after every
+	// kv2DeleteSecret (a stale cached value would send a stale cas and
+	// fail exactly the same way this fix exists to prevent) -- real
+	// bookkeeping to save one metadata read on a path that, per the common-
+	// path regression tests, never fires for the overwhelming majority of
+	// runs.
+	meta, merr := m.kv2ReadMetadata(ctx, c, relKey)
+	var cas int
+	if merr != nil {
+		if !isMetadataNotFound(merr) {
+			// Seed read failed for a real reason (network, 5xx, perms) --
+			// never fabricate a cas value. Return the ORIGINAL write error
+			// so the caller sees exactly today's loud CAS failure, with
+			// the read failure attached as context.
+			return fmt.Errorf("%w (cas seed metadata read also failed: %v)", err, merr)
+		}
+		// Secret does not exist yet on the destination -> cas=0
+		// (path_data.go:371-376: a create against an absent key requires
+		// cas=0, not 1).
+		cas = 0
+	} else {
+		// Use CurrentVersion directly, NOT CurrentVersion+1 and NOT a
+		// recomputed max(Versions map). The plugin itself increments to
+		// CurrentVersion+1 on a successful write (path_data.go:267-291);
+		// the caller's cas must equal the version BEFORE that increment.
+		// CurrentVersion is also correct when every existing version has
+		// been destroyed (destroy never advances CurrentVersion,
+		// path_destroy.go:82) or pruned by max_versions (pruning only
+		// advances OldestVersion) -- both cases getMaxVersion would get
+		// wrong, since it recomputes from the (possibly empty or pruned)
+		// Versions map instead of reading the authoritative counter.
+		cas = meta.Data.CurrentVersion
+	}
+
+	_, err = c.Client.Logical().WriteWithContext(ctx, path, map[string]any{
+		"data":    data,
+		"options": map[string]any{"cas": cas},
+	})
+	// Exactly one retry, no loop. A mismatch here ("check-and-set
+	// parameter did not match the current version") means a genuine
+	// concurrent writer raced us between the seed read and this write --
+	// exactly the condition CAS exists to catch -- and PROPAGATES as-is.
+	// Looping would turn a real conflict into an unbounded race, and
+	// since a mismatch and a missing-cas error are structurally
+	// IDENTICAL (both plain 400, see isCASRequiredError), a loop risks
+	// misclassifying one as the other and spinning. Propagate and let the
+	// caller (copySecretFull/copyIncrementalVersions/copyOneSecret) fail
+	// this secret loudly, same as it always has.
 	return err
 }
 

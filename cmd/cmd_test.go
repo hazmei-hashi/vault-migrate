@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"testing"
+	"time"
 	"vault-migrate/config"
 )
 
@@ -15,12 +16,13 @@ func TestValidateConfig(t *testing.T) {
 		{
 			name: "valid config",
 			config: config.VaultClientConfig{
-				SrcAddr:    "https://vault-src.example.com:8200",
-				DstAddr:    "https://vault-dst.example.com:8200",
-				LogLevel:   "info",
-				MaxRetries: 3,
-				StateFile:  ".vault-migrate-state.json",
-				NoState:    false,
+				SrcAddr:       "https://vault-src.example.com:8200",
+				DstAddr:       "https://vault-dst.example.com:8200",
+				LogLevel:      "info",
+				MaxRetries:    3,
+				ClientTimeout: 60 * time.Second,
+				StateFile:     ".vault-migrate-state.json",
+				NoState:       false,
 			},
 			wantErr: false,
 		},
@@ -67,10 +69,11 @@ func TestValidateConfig(t *testing.T) {
 		{
 			name: "http protocol allowed",
 			config: config.VaultClientConfig{
-				SrcAddr:   "http://localhost:8200",
-				DstAddr:   "http://localhost:8300",
-				LogLevel:  "info",
-				StateFile: "state.json",
+				SrcAddr:       "http://localhost:8200",
+				DstAddr:       "http://localhost:8300",
+				LogLevel:      "info",
+				ClientTimeout: 60 * time.Second,
+				StateFile:     "state.json",
 			},
 			wantErr: false,
 		},
@@ -87,40 +90,44 @@ func TestValidateConfig(t *testing.T) {
 		{
 			name: "debug log level",
 			config: config.VaultClientConfig{
-				SrcAddr:   "https://vault-src.example.com:8200",
-				DstAddr:   "https://vault-dst.example.com:8200",
-				LogLevel:  "debug",
-				StateFile: "state.json",
+				SrcAddr:       "https://vault-src.example.com:8200",
+				DstAddr:       "https://vault-dst.example.com:8200",
+				LogLevel:      "debug",
+				ClientTimeout: 60 * time.Second,
+				StateFile:     "state.json",
 			},
 			wantErr: false,
 		},
 		{
 			name: "warn log level",
 			config: config.VaultClientConfig{
-				SrcAddr:   "https://vault-src.example.com:8200",
-				DstAddr:   "https://vault-dst.example.com:8200",
-				LogLevel:  "warn",
-				StateFile: "state.json",
+				SrcAddr:       "https://vault-src.example.com:8200",
+				DstAddr:       "https://vault-dst.example.com:8200",
+				LogLevel:      "warn",
+				ClientTimeout: 60 * time.Second,
+				StateFile:     "state.json",
 			},
 			wantErr: false,
 		},
 		{
 			name: "error log level",
 			config: config.VaultClientConfig{
-				SrcAddr:   "https://vault-src.example.com:8200",
-				DstAddr:   "https://vault-dst.example.com:8200",
-				LogLevel:  "error",
-				StateFile: "state.json",
+				SrcAddr:       "https://vault-src.example.com:8200",
+				DstAddr:       "https://vault-dst.example.com:8200",
+				LogLevel:      "error",
+				ClientTimeout: 60 * time.Second,
+				StateFile:     "state.json",
 			},
 			wantErr: false,
 		},
 		{
 			name: "case insensitive log level",
 			config: config.VaultClientConfig{
-				SrcAddr:   "https://vault-src.example.com:8200",
-				DstAddr:   "https://vault-dst.example.com:8200",
-				LogLevel:  "INFO",
-				StateFile: "state.json",
+				SrcAddr:       "https://vault-src.example.com:8200",
+				DstAddr:       "https://vault-dst.example.com:8200",
+				LogLevel:      "INFO",
+				ClientTimeout: 60 * time.Second,
+				StateFile:     "state.json",
 			},
 			wantErr: false,
 		},
@@ -138,22 +145,24 @@ func TestValidateConfig(t *testing.T) {
 		{
 			name: "zero maxRetries allowed",
 			config: config.VaultClientConfig{
-				SrcAddr:    "https://vault-src.example.com:8200",
-				DstAddr:    "https://vault-dst.example.com:8200",
-				LogLevel:   "info",
-				MaxRetries: 0,
-				StateFile:  "state.json",
+				SrcAddr:       "https://vault-src.example.com:8200",
+				DstAddr:       "https://vault-dst.example.com:8200",
+				LogLevel:      "info",
+				MaxRetries:    0,
+				ClientTimeout: 60 * time.Second,
+				StateFile:     "state.json",
 			},
 			wantErr: false,
 		},
 		{
 			name: "empty stateFile with state tracking enabled",
 			config: config.VaultClientConfig{
-				SrcAddr:   "https://vault-src.example.com:8200",
-				DstAddr:   "https://vault-dst.example.com:8200",
-				LogLevel:  "info",
-				StateFile: "",
-				NoState:   false,
+				SrcAddr:       "https://vault-src.example.com:8200",
+				DstAddr:       "https://vault-dst.example.com:8200",
+				LogLevel:      "info",
+				ClientTimeout: 60 * time.Second,
+				StateFile:     "",
+				NoState:       false,
 			},
 			wantErr: true,
 			errMsg:  "stateFile cannot be empty when state tracking is enabled",
@@ -161,11 +170,12 @@ func TestValidateConfig(t *testing.T) {
 		{
 			name: "empty stateFile with noState flag",
 			config: config.VaultClientConfig{
-				SrcAddr:   "https://vault-src.example.com:8200",
-				DstAddr:   "https://vault-dst.example.com:8200",
-				LogLevel:  "info",
-				StateFile: "",
-				NoState:   true,
+				SrcAddr:       "https://vault-src.example.com:8200",
+				DstAddr:       "https://vault-dst.example.com:8200",
+				LogLevel:      "info",
+				ClientTimeout: 60 * time.Second,
+				StateFile:     "",
+				NoState:       true,
 			},
 			wantErr: false,
 		},
@@ -178,6 +188,41 @@ func TestValidateConfig(t *testing.T) {
 			},
 			wantErr: true,
 			errMsg:  "source address (srcAddr) cannot be empty",
+		},
+		{
+			name: "valid clientTimeout",
+			config: config.VaultClientConfig{
+				SrcAddr:       "https://vault-src.example.com:8200",
+				DstAddr:       "https://vault-dst.example.com:8200",
+				LogLevel:      "info",
+				ClientTimeout: 30 * time.Second,
+				StateFile:     "state.json",
+			},
+			wantErr: false,
+		},
+		{
+			name: "zero clientTimeout rejected",
+			config: config.VaultClientConfig{
+				SrcAddr:       "https://vault-src.example.com:8200",
+				DstAddr:       "https://vault-dst.example.com:8200",
+				LogLevel:      "info",
+				ClientTimeout: 0,
+				StateFile:     "state.json",
+			},
+			wantErr: true,
+			errMsg:  "clientTimeout must be > 0",
+		},
+		{
+			name: "negative clientTimeout rejected",
+			config: config.VaultClientConfig{
+				SrcAddr:       "https://vault-src.example.com:8200",
+				DstAddr:       "https://vault-dst.example.com:8200",
+				LogLevel:      "info",
+				ClientTimeout: -5 * time.Second,
+				StateFile:     "state.json",
+			},
+			wantErr: true,
+			errMsg:  "clientTimeout must be > 0",
 		},
 	}
 

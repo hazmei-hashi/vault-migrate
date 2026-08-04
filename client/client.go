@@ -8,6 +8,7 @@ import (
 
 	"vault-migrate/config"
 
+	"github.com/hashicorp/go-retryablehttp"
 	"github.com/hashicorp/vault/api"
 	"golang.org/x/term"
 )
@@ -30,7 +31,7 @@ func BuildClients(c config.VaultClientConfig, setFlags config.SetFlags) (*api.Cl
 		fmt.Print("Source Vault token: ")
 		data, err := term.ReadPassword(0)
 		if err != nil {
-			log.Fatalln("Error reading source token")
+			return nil, nil, fmt.Errorf("read source token: %w", err)
 		}
 		c.SrcToken = string(data)
 	} else {
@@ -61,7 +62,7 @@ func BuildClients(c config.VaultClientConfig, setFlags config.SetFlags) (*api.Cl
 		fmt.Print("Destination Vault token: ")
 		data, err := term.ReadPassword(0)
 		if err != nil {
-			log.Fatalln("Error reading destination token")
+			return nil, nil, fmt.Errorf("read destination token: %w", err)
 		}
 		c.DstToken = string(data)
 	} else {
@@ -89,13 +90,13 @@ func BuildClients(c config.VaultClientConfig, setFlags config.SetFlags) (*api.Cl
 	}
 
 	logger.Debug("Building source client...")
-	srcClient, err := getClient(c.SrcAddr, c.SrcToken, c.SrcNamespace, c.TlsSkipVerify)
+	srcClient, err := getClient(c.SrcAddr, c.SrcToken, c.SrcNamespace, c.TlsSkipVerify, c.ClientTimeout, c.MaxRetries)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	logger.Debug("Building destination client...")
-	dstClient, err := getClient(c.DstAddr, c.DstToken, c.DstNamespace, c.TlsSkipVerify)
+	dstClient, err := getClient(c.DstAddr, c.DstToken, c.DstNamespace, c.TlsSkipVerify, c.ClientTimeout, c.MaxRetries)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -103,9 +104,11 @@ func BuildClients(c config.VaultClientConfig, setFlags config.SetFlags) (*api.Cl
 	return srcClient, dstClient, nil
 }
 
-func getClient(address string, token string, namespace string, skipVerify bool) (*api.Client, error) {
+func getClient(address string, token string, namespace string, skipVerify bool, timeout time.Duration, maxRetries int) (*api.Client, error) {
 	clientConfig := &api.Config{
-		Address: address,
+		Address:    address,
+		MaxRetries: maxRetries,
+		Backoff:    retryablehttp.RateLimitLinearJitterBackoff,
 	}
 
 	if err := clientConfig.ConfigureTLS(&api.TLSConfig{Insecure: skipVerify}); err != nil {
@@ -113,19 +116,20 @@ func getClient(address string, token string, namespace string, skipVerify bool) 
 	}
 	client, err := api.NewClient(clientConfig)
 	if err != nil {
-		log.Fatal(err)
+		return nil, fmt.Errorf("create client for %s: %w", address, err)
 	}
 	client.SetReadYourWrites(true)
-	client.SetClientTimeout(3 * time.Second)
+	client.SetClientTimeout(timeout)
+	client.SetMaxRetries(maxRetries)
 	client.SetToken(token)
 
 	health, err := client.Sys().Health()
 	if err != nil {
-		log.Fatalf("Health check failed for %s: %v", address, err)
+		return nil, fmt.Errorf("health check failed for %s: %w", address, err)
 	} else if !health.Initialized {
-		log.Fatalf("%s is not initialized, aborting.", address)
+		return nil, fmt.Errorf("%s is not initialized", address)
 	} else if health.Sealed {
-		log.Fatalf("%s is sealed, aborting.", address)
+		return nil, fmt.Errorf("%s is sealed", address)
 	}
 
 	// Namespace-scoped Enterprise tokens need the namespace set before
@@ -134,7 +138,7 @@ func getClient(address string, token string, namespace string, skipVerify bool) 
 
 	lookup, err := client.Auth().Token().LookupSelf()
 	if err != nil {
-		log.Fatalf("Token lookup failed for %s (namespace %q): %v", address, namespace, err)
+		return nil, fmt.Errorf("token lookup failed for %s (namespace %q): %w", address, namespace, err)
 	} else {
 		ttl, _ := lookup.TokenTTL()
 		log.Printf("Found initialized/unsealed cluster %s (Token TTL: %v)\n", health.ClusterID, ttl)
