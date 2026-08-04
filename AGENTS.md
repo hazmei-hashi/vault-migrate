@@ -80,6 +80,11 @@ Conventions:
   deleted/destroyed versions (not a bare error) and enforces per-secret and
   mount-level `max_versions` sliding-window pruning on write, so pruning- and
   soft-delete-related bugs are reachable by the mock instead of masked by it.
+  It also enforces per-secret and mount-level `cas_required` on data writes,
+  checking the `options.cas` VALUE against the fake secret's `CurrentVersion`
+  (not just its presence) — mirrors `path_data.go:283-288`'s unconditional
+  check, so an implementation sending a wrong/hardcoded cas value fails the
+  mock the same way it fails real Vault.
 - `client/client_test.go` provides a matching `httptest.Server`-backed fake
   for `sys/health` and `auth/token/lookup-self`, covering every `getClient`
   error path plus regression locks for namespace-before-lookup, max retries,

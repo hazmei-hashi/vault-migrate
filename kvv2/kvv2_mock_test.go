@@ -76,6 +76,30 @@ type fakeVault struct {
 	forceMetadataReadErrorStatus int
 	secrets                      map[string]*fakeKVSecret
 	server                       *httptest.Server
+	// dataWriteBodies records every /data/<relKey> POST/PUT request body,
+	// in order, for Task 5's common-path regression locks: proving a
+	// non-cas_required destination never sends an "options" key at all,
+	// and that no extra request is issued per version.
+	dataWriteBodies []map[string]any
+	// metadataGETCount counts every metadata GET (not LIST) request, used
+	// by Task 5 to prove Task 2's CAS retry issues zero metadata reads on
+	// the common (non-cas_required) path.
+	metadataGETCount int
+	// afterMetadataGET, when set for a key, fires exactly once immediately
+	// after that key's next metadata GET response is served, then clears
+	// itself. Used by TestKV2WriteData_CASMismatchIsNotRetried to simulate
+	// a genuine concurrent writer racing between B19's CAS seed read and
+	// its single retry write.
+	afterMetadataGET map[string]func()
+	// forceDataWriteErrorKey/Status/Message, when Key is non-empty, makes
+	// every /data/<key> POST/PUT fail with Status/Message instead of
+	// reaching the normal CAS-gate/write logic -- simulating a real
+	// non-CAS failure (permission denied, KV v1 "unsupported path", 5xx)
+	// that has nothing to do with check-and-set, for Task 5's B17
+	// regression locks.
+	forceDataWriteErrorKey     string
+	forceDataWriteErrorStatus  int
+	forceDataWriteErrorMessage string
 }
 
 func newFakeVault(t *testing.T) *fakeVault {
@@ -214,6 +238,66 @@ func (f *fakeVault) deleteCalls() int {
 	defer f.mu.Unlock()
 
 	return f.deleteSecretCalls
+}
+
+// dataWrites returns a copy of every /data/ POST/PUT request body recorded
+// so far, in request order, for Task 5's common-path regression locks.
+func (f *fakeVault) dataWrites() []map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	out := make([]map[string]any, len(f.dataWriteBodies))
+	copy(out, f.dataWriteBodies)
+	return out
+}
+
+// metadataGETs returns how many metadata GET (not LIST) requests have been
+// issued so far, for Task 5's proof that the CAS retry issues zero extra
+// metadata reads on a destination that never required CAS.
+func (f *fakeVault) metadataGETs() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.metadataGETCount
+}
+
+// setAfterMetadataGET registers hook to run exactly once, immediately after
+// the next metadata GET response for key is served, then clears itself.
+// Used by TestKV2WriteData_CASMismatchIsNotRetried to inject a concurrent
+// writer between B19's CAS seed read and its single retry write.
+func (f *fakeVault) setAfterMetadataGET(key string, hook func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.afterMetadataGET == nil {
+		f.afterMetadataGET = make(map[string]func())
+	}
+	f.afterMetadataGET[key] = hook
+}
+
+// setForceDataWriteError makes every subsequent /data/<key> POST/PUT fail
+// with status/message instead of reaching the normal CAS-gate/write logic,
+// simulating a real non-CAS failure (403 permission denied, 500, etc.) for
+// Task 5's regression lock that such errors propagate on the first attempt
+// with no retry and no metadata read.
+func (f *fakeVault) setForceDataWriteError(key string, status int, message string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.forceDataWriteErrorKey = key
+	f.forceDataWriteErrorStatus = status
+	f.forceDataWriteErrorMessage = message
+}
+
+// bumpCurrentVersionLocked adds a new version directly, bypassing
+// kv2WriteData/handleData's CAS gate entirely -- it simulates a genuine
+// concurrent writer racing in via some other path. Caller must already
+// hold f.mu (this is meant to be invoked from inside a handler, e.g. an
+// afterMetadataGET hook).
+func (f *fakeVault) bumpCurrentVersionLocked(key string, data map[string]any) {
+	sec := f.ensureSecret(key)
+	sec.CurrentVersion++
+	sec.Versions[sec.CurrentVersion] = &fakeKVVersion{Data: cloneMap(data)}
 }
 
 // setForceListError makes every subsequent metadata LIST request fail with
@@ -548,6 +632,7 @@ func (f *fakeVault) handleMetadata(w http.ResponseWriter, r *http.Request, relKe
 		w.WriteHeader(http.StatusNoContent)
 		return
 	case http.MethodGet:
+		f.metadataGETCount++
 		if f.forceMetadataReadErrorKey != "" && f.forceMetadataReadErrorKey == relKey {
 			status := f.forceMetadataReadErrorStatus
 			if status == 0 {
@@ -580,6 +665,10 @@ func (f *fakeVault) handleMetadata(w http.ResponseWriter, r *http.Request, relKe
 				"versions":             versions,
 			},
 		})
+		if hook, ok := f.afterMetadataGET[relKey]; ok {
+			delete(f.afterMetadataGET, relKey)
+			hook()
+		}
 		return
 	case http.MethodPost, http.MethodPut:
 		body, err := readBodyMap(r)
@@ -677,6 +766,20 @@ func (f *fakeVault) handleData(w http.ResponseWriter, r *http.Request, relKey st
 			writeJSON(w, http.StatusBadRequest, map[string]any{"errors": []string{err.Error()}})
 			return
 		}
+		f.dataWriteBodies = append(f.dataWriteBodies, body)
+
+		if f.forceDataWriteErrorKey != "" && f.forceDataWriteErrorKey == relKey {
+			status := f.forceDataWriteErrorStatus
+			if status == 0 {
+				status = http.StatusInternalServerError
+			}
+			msg := f.forceDataWriteErrorMessage
+			if msg == "" {
+				msg = "injected data write failure"
+			}
+			writeJSON(w, status, map[string]any{"errors": []string{msg}})
+			return
+		}
 
 		// Real Vault enforces check-and-set at write time when EITHER the
 		// mount-level or per-secret cas_required is true
@@ -690,14 +793,35 @@ func (f *fakeVault) handleData(w http.ResponseWriter, r *http.Request, relKey st
 		if hasExisting && existing.CASRequired {
 			casRequired = true
 		}
-		if casRequired {
-			options, _ := body["options"].(map[string]any)
-			if _, hasCAS := options["cas"]; !hasCAS {
+		currentVersion := 0
+		if hasExisting {
+			currentVersion = existing.CurrentVersion
+		}
+
+		options, _ := body["options"].(map[string]any)
+		casVal, hasCAS := options["cas"]
+		if hasCAS {
+			// path_data.go:283-284 -- "if casOk" validates the cas VALUE
+			// unconditionally, before ever checking cas_required. A
+			// caller that sends cas=N on a destination that never asked
+			// for CAS still gets rejected if N is wrong. Mirror that here
+			// so an implementation sending a wrong/hardcoded cas value
+			// (e.g. always 0, or CurrentVersion+1) fails this mock the
+			// same way it would fail real Vault, instead of passing every
+			// mock test on presence alone.
+			if asInt(casVal) != currentVersion {
 				writeJSON(w, http.StatusBadRequest, map[string]any{
-					"errors": []string{"check-and-set parameter required for this call"},
+					"errors": []string{"check-and-set parameter did not match the current version"},
 				})
 				return
 			}
+		} else if casRequired {
+			// path_data.go:286-288 -- "else if config.CasRequired ||
+			// meta.CasRequired" only fires when cas was NOT sent at all.
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"errors": []string{"check-and-set parameter required for this call"},
+			})
+			return
 		}
 
 		payload, _ := body["data"].(map[string]any)
@@ -2214,19 +2338,17 @@ func TestCopyIncrementalVersions_DestVersionCountMeasuredFromDestination(t *test
 	}
 }
 
-// TestCopySecretFull_CASRequiredDestination_FailsLoudly is Task 1's boundary
-// lock. kv2WriteData (kvv2.go ~720-730) sends only {"data": ...} -- it never
-// sends "options.cas" on any version write. Real Vault's KV v2 plugin
-// rejects such a write with 400 "check-and-set parameter required for this
-// call" whenever check-and-set is required, either by the destination
-// secret's own per-secret cas_required OR by the destination mount's
-// cas_required tunable (vault-plugin-secrets-kv@v0.26.2 path_data.go:
-// 278-288). This test pre-configures the DESTINATION with cas_required=true
-// (as an operator independently tuning their own destination would) and
-// asserts copySecretFull fails on the very first version write instead of
-// silently succeeding -- documenting real product behavior: migrating INTO
-// a cas_required destination is not supported today. See TODO.md B19.
-func TestCopySecretFull_CASRequiredDestination_FailsLoudly(t *testing.T) {
+// TestCopySecretFull_CASRequiredDestination locks B19's fix. Real Vault's
+// KV v2 plugin requires check-and-set on every data write whenever the
+// destination secret's own per-secret cas_required OR the destination
+// mount's cas_required tunable is true
+// (vault-plugin-secrets-kv@v0.26.2 path_data.go:278-288). kv2WriteData now
+// reactively retries with options.cas=<destination CurrentVersion> after
+// the first no-cas write 400s, so migrating INTO a cas_required destination
+// succeeds instead of failing on version 1. Covers both triggers: the
+// per-secret cas_required (via setMetadata) and the mount-level tunable
+// (via setMountCASRequired).
+func TestCopySecretFull_CASRequiredDestination(t *testing.T) {
 	tests := []struct {
 		name  string
 		setup func(dst *fakeVault)
@@ -2251,6 +2373,8 @@ func TestCopySecretFull_CASRequiredDestination_FailsLoudly(t *testing.T) {
 			dst := newFakeVault(t)
 
 			src.putVersion("app/secret", map[string]any{"value": "v1"})
+			src.putVersion("app/secret", map[string]any{"value": "v2"})
+			src.putVersion("app/secret", map[string]any{"value": "v3"})
 			tt.setup(dst)
 
 			m := newTestMigrator(t, src, dst, true)
@@ -2263,20 +2387,440 @@ func TestCopySecretFull_CASRequiredDestination_FailsLoudly(t *testing.T) {
 			err = m.copySecretFull(context.Background(), "app/secret", "app/secret", srcMeta, Options{
 				Placeholder: map[string]any{"_vault_migrate": "placeholder"},
 			})
-			if err == nil {
-				t.Fatalf("copySecretFull returned nil error against a cas_required destination; " +
-					"kv2WriteData never sends options.cas, so this must fail loudly, not silently succeed")
-			}
-			if !strings.Contains(err.Error(), "check-and-set parameter required") {
-				t.Fatalf("error = %q, want it to contain real Vault's check-and-set error text", err.Error())
+			if err != nil {
+				t.Fatalf("copySecretFull against a cas_required destination = %v, want nil (B19 fixed)", err)
 			}
 
-			// No state entry should be recorded for a secret that failed to
-			// migrate -- copySecretFull must return before reaching the
-			// state.UpdateSecret call.
-			if sec := m.State.GetSecret("app/secret"); sec != nil {
-				t.Fatalf("expected no state entry for a secret whose copy failed, got %+v", sec)
+			for v := 1; v <= 3; v++ {
+				srcPayload, err := m.kv2ReadVersion(context.Background(), m.Src, "app/secret", v)
+				if err != nil {
+					t.Fatalf("read src version %d: %v", v, err)
+				}
+				dstPayload, err := m.kv2ReadVersion(context.Background(), m.Dst, "app/secret", v)
+				if err != nil {
+					t.Fatalf("read dst version %d: %v", v, err)
+				}
+				if !reflect.DeepEqual(srcPayload, dstPayload) {
+					t.Fatalf("version %d payload mismatch: src=%v dst=%v", v, srcPayload, dstPayload)
+				}
+			}
+
+			sec := m.State.GetSecret("app/secret")
+			if sec == nil {
+				t.Fatalf("expected a completed state entry, got none")
+			}
+			if sec.Status != "completed" {
+				t.Fatalf("state status = %q, want completed", sec.Status)
 			}
 		})
+	}
+}
+
+// TestKV2WriteData_CASRequiredRetriesWithCurrentVersion is Task 4's core
+// fix-proving test: kv2WriteData's single retry must seed options.cas from
+// the destination's CurrentVersion, not a fabricated/derived value.
+func TestKV2WriteData_CASRequiredRetriesWithCurrentVersion(t *testing.T) {
+	t.Run("fresh secret seeds cas=0", func(t *testing.T) {
+		dst := newFakeVault(t)
+		dst.setMountCASRequired(true)
+		m := newTestMigrator(t, dst, dst, false)
+
+		err := m.kv2WriteData(context.Background(), m.Dst, "app/secret", map[string]any{"value": "v1"})
+		if err != nil {
+			t.Fatalf("kv2WriteData failed: %v", err)
+		}
+
+		writes := dst.dataWrites()
+		if len(writes) != 2 {
+			t.Fatalf("expected exactly 2 write attempts (rejected + single retry), got %d", len(writes))
+		}
+		if _, hasOpts := writes[0]["options"]; hasOpts {
+			t.Fatalf("first write should carry no options key, got %v", writes[0])
+		}
+		opts, ok := writes[1]["options"].(map[string]any)
+		if !ok {
+			t.Fatalf("retry write missing options: %v", writes[1])
+		}
+		if asInt(opts["cas"]) != 0 {
+			t.Fatalf("cas = %v, want 0 for a brand-new destination secret", opts["cas"])
+		}
+	})
+
+	t.Run("existing secret seeds cas=CurrentVersion not +1", func(t *testing.T) {
+		dst := newFakeVault(t)
+		dst.putVersion("app/secret", map[string]any{"value": "v1"})
+		dst.putVersion("app/secret", map[string]any{"value": "v2"})
+		dst.putVersion("app/secret", map[string]any{"value": "v3"})
+		dst.setMountCASRequired(true)
+		m := newTestMigrator(t, dst, dst, false)
+
+		err := m.kv2WriteData(context.Background(), m.Dst, "app/secret", map[string]any{"value": "v4"})
+		if err != nil {
+			t.Fatalf("kv2WriteData failed: %v", err)
+		}
+
+		writes := dst.dataWrites()
+		last := writes[len(writes)-1]
+		opts, ok := last["options"].(map[string]any)
+		if !ok {
+			t.Fatalf("retry write missing options: %v", last)
+		}
+		if asInt(opts["cas"]) != 3 {
+			t.Fatalf("cas = %v, want 3 (CurrentVersion); the plugin itself advances to 4 on success -- sending 4 would be rejected as a mismatch", opts["cas"])
+		}
+	})
+}
+
+// TestKV2WriteData_CASRequiredAllVersionsDestroyed locks the case the design
+// explicitly calls out: destroy never touches CurrentVersion
+// (path_destroy.go:82), so a destination whose every version has been
+// destroyed still has a non-zero CurrentVersion, and the retry must use it
+// -- NOT fall back to 0 as a naive "secret looks empty" heuristic would.
+func TestKV2WriteData_CASRequiredAllVersionsDestroyed(t *testing.T) {
+	dst := newFakeVault(t)
+	dst.putVersion("app/secret", map[string]any{"value": "v1"})
+	dst.putVersion("app/secret", map[string]any{"value": "v2"})
+	dst.putVersion("app/secret", map[string]any{"value": "v3"})
+	dst.markVersionDestroyed("app/secret", 1)
+	dst.markVersionDestroyed("app/secret", 2)
+	dst.markVersionDestroyed("app/secret", 3)
+	dst.setMountCASRequired(true)
+
+	m := newTestMigrator(t, dst, dst, false)
+	err := m.kv2WriteData(context.Background(), m.Dst, "app/secret", map[string]any{"value": "v4"})
+	if err != nil {
+		t.Fatalf("kv2WriteData failed: %v", err)
+	}
+
+	writes := dst.dataWrites()
+	last := writes[len(writes)-1]
+	opts, ok := last["options"].(map[string]any)
+	if !ok {
+		t.Fatalf("retry write missing options: %v", last)
+	}
+	if asInt(opts["cas"]) != 3 {
+		t.Fatalf("cas = %v, want 3 (CurrentVersion unaffected by destroy), NOT 0", opts["cas"])
+	}
+}
+
+// TestKV2WriteData_CASMismatchIsNotRetried locks that a genuine concurrent
+// writer -- one that lands between B19's seed metadata read and its single
+// retry write -- produces a propagated mismatch error, NOT a second retry.
+// Exactly 2 write attempts total (the original rejected write + the one
+// retry); a loop would keep re-reading and re-writing indefinitely.
+func TestKV2WriteData_CASMismatchIsNotRetried(t *testing.T) {
+	dst := newFakeVault(t)
+	dst.putVersion("app/secret", map[string]any{"value": "v1"})
+	dst.setMountCASRequired(true)
+	dst.setAfterMetadataGET("app/secret", func() {
+		// A different writer advances CurrentVersion right after our seed
+		// read observes it, so the cas we send next is already stale.
+		dst.bumpCurrentVersionLocked("app/secret", map[string]any{"value": "concurrent"})
+	})
+
+	m := newTestMigrator(t, dst, dst, false)
+	err := m.kv2WriteData(context.Background(), m.Dst, "app/secret", map[string]any{"value": "v2"})
+	if err == nil {
+		t.Fatalf("expected CAS mismatch error to propagate, got nil")
+	}
+	if !strings.Contains(err.Error(), "did not match the current version") {
+		t.Fatalf("error = %q, want the mismatch message propagated as-is", err.Error())
+	}
+
+	writes := dst.dataWrites()
+	if len(writes) != 2 {
+		t.Fatalf("expected exactly 2 write attempts (no loop on a genuine mismatch), got %d", len(writes))
+	}
+}
+
+// TestKV2WriteData_CASSeedMetadataReadFailure locks that a failed seed
+// metadata read (network, 5xx, perms -- NOT "not found") never fabricates a
+// cas value. The ORIGINAL CAS-required write error must propagate, with the
+// read failure attached as context, and no retry write may be attempted.
+func TestKV2WriteData_CASSeedMetadataReadFailure(t *testing.T) {
+	dst := newFakeVault(t)
+	dst.putVersion("app/secret", map[string]any{"value": "v1"})
+	dst.setMountCASRequired(true)
+	dst.setForceMetadataReadError("app/secret", http.StatusInternalServerError)
+
+	m := newTestMigrator(t, dst, dst, false)
+	err := m.kv2WriteData(context.Background(), m.Dst, "app/secret", map[string]any{"value": "v2"})
+	if err == nil {
+		t.Fatalf("expected an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "check-and-set parameter required") {
+		t.Fatalf("error = %q, want the original CAS-required error preserved", err.Error())
+	}
+	if !strings.Contains(err.Error(), "injected metadata read failure") {
+		t.Fatalf("error = %q, want the seed metadata read failure attached as context", err.Error())
+	}
+
+	writes := dst.dataWrites()
+	if len(writes) != 1 {
+		t.Fatalf("expected exactly 1 write attempt (no retry when the cas seed read fails), got %d", len(writes))
+	}
+	if _, hasOpts := writes[0]["options"]; hasOpts {
+		t.Fatalf("no retry should have been attempted: %v", writes[0])
+	}
+}
+
+// TestCopyIncrementalVersions_CASRequiredDestination locks B19's fix through
+// the incremental copy path (not just copySecretFull).
+func TestCopyIncrementalVersions_CASRequiredDestination(t *testing.T) {
+	src := newFakeVault(t)
+	dst := newFakeVault(t)
+
+	src.putVersion("app/secret", map[string]any{"value": "v1"})
+	src.putVersion("app/secret", map[string]any{"value": "v2"})
+	src.putVersion("app/secret", map[string]any{"value": "v3"})
+	dst.putVersion("app/secret", map[string]any{"value": "v1"})
+	dst.setMountCASRequired(true)
+
+	m := newTestMigrator(t, src, dst, true)
+
+	srcMeta, err := m.kv2ReadMetadata(context.Background(), m.Src, "app/secret")
+	if err != nil {
+		t.Fatalf("read src metadata failed: %v", err)
+	}
+
+	err = m.copyIncrementalVersions(context.Background(), "app/secret", "app/secret", srcMeta, 2, 3, Options{
+		Placeholder: map[string]any{"_vault_migrate": "placeholder"},
+	})
+	if err != nil {
+		t.Fatalf("copyIncrementalVersions against a cas_required destination = %v, want nil", err)
+	}
+
+	for v := 2; v <= 3; v++ {
+		got, err := m.kv2ReadVersion(context.Background(), m.Dst, "app/secret", v)
+		if err != nil {
+			t.Fatalf("read dst v%d: %v", v, err)
+		}
+		want, err := m.kv2ReadVersion(context.Background(), m.Src, "app/secret", v)
+		if err != nil {
+			t.Fatalf("read src v%d: %v", v, err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("v%d mismatch: got=%v want=%v", v, got, want)
+		}
+	}
+
+	sec := m.State.GetSecret("app/secret")
+	if sec == nil || sec.Status != "completed" {
+		t.Fatalf("expected completed state, got %+v", sec)
+	}
+}
+
+// TestCopyOneSecret_CASRequiredDestination locks B19's fix through the
+// no-state copy path (copyOneSecret), which never performs its own
+// destination metadata read outside of kv2WriteData's internal retry.
+func TestCopyOneSecret_CASRequiredDestination(t *testing.T) {
+	src := newFakeVault(t)
+	dst := newFakeVault(t)
+
+	src.putVersion("app/secret", map[string]any{"value": "v1"})
+	src.putVersion("app/secret", map[string]any{"value": "v2"})
+	dst.setMountCASRequired(true)
+
+	m := newTestMigrator(t, src, dst, false)
+
+	err := m.copyOneSecret(context.Background(), "app/secret", "app/secret", Options{
+		Placeholder: map[string]any{"_vault_migrate": "placeholder"},
+	})
+	if err != nil {
+		t.Fatalf("copyOneSecret against a cas_required destination = %v, want nil", err)
+	}
+
+	for v := 1; v <= 2; v++ {
+		got, err := m.kv2ReadVersion(context.Background(), m.Dst, "app/secret", v)
+		if err != nil {
+			t.Fatalf("read dst v%d: %v", v, err)
+		}
+		if got["value"] != fmt.Sprintf("v%d", v) {
+			t.Fatalf("dst v%d value = %v, want v%d", v, got["value"], v)
+		}
+	}
+}
+
+// TestCopyOneSecretWithState_CASRequiredAfterDeleteRecopy locks the
+// stale-cas-after-delete trap: copyOneSecretWithState detects a destination
+// mismatch, calls kv2DeleteSecret (destination secret now genuinely gone),
+// then calls copySecretFull on a cas_required MOUNT. The very first write
+// after the delete must seed cas=0 from a fresh metadata read -- any cached
+// pre-delete CurrentVersion would be stale and get rejected as a mismatch.
+func TestCopyOneSecretWithState_CASRequiredAfterDeleteRecopy(t *testing.T) {
+	src := newFakeVault(t)
+	dst := newFakeVault(t)
+
+	src.putVersion("app/secret", map[string]any{"value": "source"})
+	dst.putVersion("app/secret", map[string]any{"value": "destination"}) // forces hash mismatch
+	dst.setMountCASRequired(true)
+
+	m := newTestMigrator(t, src, dst, true)
+
+	err := m.copyOneSecretWithState(context.Background(), "app/secret", "app/secret", Options{
+		Placeholder: map[string]any{"_vault_migrate": "placeholder"},
+	})
+	if err != nil {
+		t.Fatalf("copyOneSecretWithState delete+recopy on a cas_required mount = %v, want nil", err)
+	}
+
+	if dst.deleteCalls() != 1 {
+		t.Fatalf("expected exactly 1 kv2DeleteSecret call, got %d", dst.deleteCalls())
+	}
+
+	v1, err := m.kv2ReadVersion(context.Background(), m.Dst, "app/secret", 1)
+	if err != nil {
+		t.Fatalf("read recreated v1: %v", err)
+	}
+	if v1["value"] != "source" {
+		t.Fatalf("recreated v1 value = %v, want source", v1["value"])
+	}
+}
+
+// TestKV2WriteData_NoCASSentWhenNotRequired is Task 5's highest-value test:
+// on a destination that never requires check-and-set, NOT ONE write may
+// carry an "options" key. This is the overwhelming common case in real
+// runs and must be byte-identical to the pre-B19 wire format.
+func TestKV2WriteData_NoCASSentWhenNotRequired(t *testing.T) {
+	dst := newFakeVault(t)
+	m := newTestMigrator(t, dst, dst, false)
+
+	for i := 0; i < 3; i++ {
+		if err := m.kv2WriteData(context.Background(), m.Dst, "app/secret", map[string]any{"value": i}); err != nil {
+			t.Fatalf("kv2WriteData failed: %v", err)
+		}
+	}
+
+	for i, body := range dst.dataWrites() {
+		if _, hasOpts := body["options"]; hasOpts {
+			t.Fatalf("write %d carries an options key on a non-cas_required destination: %v", i, body)
+		}
+	}
+}
+
+// TestKV2WriteData_NoExtraRequestsWhenNotRequired locks that the common
+// path issues exactly one /data/ write per version and ZERO
+// CAS-attributable metadata GETs -- the retry path in kv2WriteData must
+// never fire when the initial write already succeeds.
+func TestKV2WriteData_NoExtraRequestsWhenNotRequired(t *testing.T) {
+	dst := newFakeVault(t)
+	m := newTestMigrator(t, dst, dst, false)
+
+	before := dst.metadataGETs()
+	const n = 5
+	for i := 0; i < n; i++ {
+		if err := m.kv2WriteData(context.Background(), m.Dst, "app/secret", map[string]any{"value": i}); err != nil {
+			t.Fatalf("kv2WriteData failed: %v", err)
+		}
+	}
+
+	if got := len(dst.dataWrites()); got != n {
+		t.Fatalf("/data/ write count = %d, want exactly %d", got, n)
+	}
+	if got := dst.metadataGETs() - before; got != 0 {
+		t.Fatalf("metadata GET count = %d, want 0 (no CAS retry should fire)", got)
+	}
+}
+
+// TestKV2WriteData_400NonCASNotRetried is a B17 regression lock: a 400 with
+// an unrelated message (e.g. a KV v1 mount's "unsupported path") must
+// propagate untouched, never triggering the CAS retry.
+func TestKV2WriteData_400NonCASNotRetried(t *testing.T) {
+	dst := newFakeVault(t)
+	dst.setForceDataWriteError("app/secret", http.StatusBadRequest, "unsupported path")
+
+	m := newTestMigrator(t, dst, dst, false)
+	err := m.kv2WriteData(context.Background(), m.Dst, "app/secret", map[string]any{"value": "v1"})
+	if err == nil {
+		t.Fatalf("expected the unrelated 400 to propagate, got nil")
+	}
+	if !strings.Contains(err.Error(), "unsupported path") {
+		t.Fatalf("error = %q, want the original unrelated 400 message preserved", err.Error())
+	}
+	if got := len(dst.dataWrites()); got != 1 {
+		t.Fatalf("write count = %d, want exactly 1 (no retry on an unrelated 400)", got)
+	}
+	if got := dst.metadataGETs(); got != 0 {
+		t.Fatalf("metadata GET count = %d, want 0 (no CAS retry should fire)", got)
+	}
+}
+
+// TestKV2WriteData_Non400ErrorNotRetried locks that 403 and 500 responses
+// propagate immediately on the first attempt -- no retry, no metadata read.
+// Client-level transport retries (B14, retryablehttp's own 5xx backoff) are
+// a separate concern from this app-level CAS retry; disable them here via
+// SetMaxRetries(0) so the assertion isolates kv2WriteData's own behavior.
+func TestKV2WriteData_Non400ErrorNotRetried(t *testing.T) {
+	for _, status := range []int{http.StatusForbidden, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			dst := newFakeVault(t)
+			dst.setForceDataWriteError("app/secret", status, "")
+
+			m := newTestMigrator(t, dst, dst, false)
+			m.Dst.Client.SetMaxRetries(0)
+			err := m.kv2WriteData(context.Background(), m.Dst, "app/secret", map[string]any{"value": "v1"})
+			if err == nil {
+				t.Fatalf("expected a %d error to propagate, got nil", status)
+			}
+			if got := len(dst.dataWrites()); got != 1 {
+				t.Fatalf("write count = %d, want exactly 1 (no retry on a %d)", got, status)
+			}
+			if got := dst.metadataGETs(); got != 0 {
+				t.Fatalf("metadata GET count = %d, want 0 (no CAS retry should fire on a %d)", got, status)
+			}
+		})
+	}
+}
+
+// TestCopySecretFull_SourceCASRequiredSurvivesSecondRun is Task 6's test for
+// a finding NOT in TODO.md's original B19 entry: kv2WriteMetadataSettings
+// (kvv2.go:839-856) sends cas_required from SOURCE metadata unconditionally,
+// AFTER the version-write loop. A source secret with cas_required=true
+// therefore self-inflicts B19 on the destination: run 1 succeeds (dest had
+// no cas_required yet) then stamps cas_required=true onto the dest as its
+// very last step; run 2's incremental write would 400 without B19's fix.
+// Needs ZERO destination-side operator action.
+func TestCopySecretFull_SourceCASRequiredSurvivesSecondRun(t *testing.T) {
+	src := newFakeVault(t)
+	dst := newFakeVault(t)
+
+	src.putVersion("app/secret", map[string]any{"value": "v1"})
+	src.setMetadata("app/secret", true, 0, "", nil) // source cas_required=true
+
+	m := newTestMigrator(t, src, dst, true)
+
+	srcMeta, err := m.kv2ReadMetadata(context.Background(), m.Src, "app/secret")
+	if err != nil {
+		t.Fatalf("read src metadata failed: %v", err)
+	}
+	if err := m.copySecretFull(context.Background(), "app/secret", "app/secret", srcMeta, Options{
+		Placeholder: map[string]any{"_vault_migrate": "placeholder"},
+	}); err != nil {
+		t.Fatalf("run 1 (copySecretFull) failed: %v", err)
+	}
+
+	// Destination now has cas_required=true stamped on it by run 1's own
+	// kv2WriteMetadataSettings call, with zero destination-side operator
+	// action. Add a source version and run an incremental copy -- this is
+	// self-inflicted B19.
+	src.putVersion("app/secret", map[string]any{"value": "v2"})
+
+	srcMeta2, err := m.kv2ReadMetadata(context.Background(), m.Src, "app/secret")
+	if err != nil {
+		t.Fatalf("read src metadata (run 2) failed: %v", err)
+	}
+	err = m.copyIncrementalVersions(context.Background(), "app/secret", "app/secret", srcMeta2, 2, 2, Options{
+		Placeholder: map[string]any{"_vault_migrate": "placeholder"},
+	})
+	if err != nil {
+		t.Fatalf("run 2 (copyIncrementalVersions) failed: %v -- source cas_required must not survive as a self-inflicted destination failure", err)
+	}
+
+	v2, err := m.kv2ReadVersion(context.Background(), m.Dst, "app/secret", 2)
+	if err != nil {
+		t.Fatalf("read dst v2: %v", err)
+	}
+	if v2["value"] != "v2" {
+		t.Fatalf("dst v2 value = %v, want v2", v2["value"])
 	}
 }

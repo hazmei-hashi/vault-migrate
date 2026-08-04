@@ -813,6 +813,69 @@ func (m *Migrator) kv2WriteData(ctx context.Context, c KVV2Cluster, relKey strin
 	_, err := c.Client.Logical().WriteWithContext(ctx, path, map[string]any{
 		"data": data,
 	})
+	if err == nil {
+		return nil
+	}
+	if !isCASRequiredError(err) {
+		return err
+	}
+
+	// --- only reachable on a cas_required destination (mount or secret) ---
+	//
+	// ponytail: no cas threaded through call sites, no version counter
+	// kept on Migrator -- the write response and metadata current_version
+	// are authoritative on demand, read reactively only when a write
+	// actually needs it. A cached counter would need seeding on every path
+	// that can create/advance a destination version (this write, delete,
+	// destroy, and the pre-existing dest-ahead branch in
+	// copyOneSecretWithState) plus invalidation after every
+	// kv2DeleteSecret (a stale cached value would send a stale cas and
+	// fail exactly the same way this fix exists to prevent) -- real
+	// bookkeeping to save one metadata read on a path that, per the common-
+	// path regression tests, never fires for the overwhelming majority of
+	// runs.
+	meta, merr := m.kv2ReadMetadata(ctx, c, relKey)
+	var cas int
+	if merr != nil {
+		if !isMetadataNotFound(merr) {
+			// Seed read failed for a real reason (network, 5xx, perms) --
+			// never fabricate a cas value. Return the ORIGINAL write error
+			// so the caller sees exactly today's loud CAS failure, with
+			// the read failure attached as context.
+			return fmt.Errorf("%w (cas seed metadata read also failed: %v)", err, merr)
+		}
+		// Secret does not exist yet on the destination -> cas=0
+		// (path_data.go:371-376: a create against an absent key requires
+		// cas=0, not 1).
+		cas = 0
+	} else {
+		// Use CurrentVersion directly, NOT CurrentVersion+1 and NOT a
+		// recomputed max(Versions map). The plugin itself increments to
+		// CurrentVersion+1 on a successful write (path_data.go:267-291);
+		// the caller's cas must equal the version BEFORE that increment.
+		// CurrentVersion is also correct when every existing version has
+		// been destroyed (destroy never advances CurrentVersion,
+		// path_destroy.go:82) or pruned by max_versions (pruning only
+		// advances OldestVersion) -- both cases getMaxVersion would get
+		// wrong, since it recomputes from the (possibly empty or pruned)
+		// Versions map instead of reading the authoritative counter.
+		cas = meta.Data.CurrentVersion
+	}
+
+	_, err = c.Client.Logical().WriteWithContext(ctx, path, map[string]any{
+		"data":    data,
+		"options": map[string]any{"cas": cas},
+	})
+	// Exactly one retry, no loop. A mismatch here ("check-and-set
+	// parameter did not match the current version") means a genuine
+	// concurrent writer raced us between the seed read and this write --
+	// exactly the condition CAS exists to catch -- and PROPAGATES as-is.
+	// Looping would turn a real conflict into an unbounded race, and
+	// since a mismatch and a missing-cas error are structurally
+	// IDENTICAL (both plain 400, see isCASRequiredError), a loop risks
+	// misclassifying one as the other and spinning. Propagate and let the
+	// caller (copySecretFull/copyIncrementalVersions/copyOneSecret) fail
+	// this secret loudly, same as it always has.
 	return err
 }
 

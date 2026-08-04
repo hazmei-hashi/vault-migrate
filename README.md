@@ -106,8 +106,11 @@ Test conventions:
   reads against deleted/destroyed versions, per-secret and mount-level
   `max_versions` sliding-window pruning, per-secret and mount-level
   `cas_required` enforcement on data writes (rejecting a write with no
-  `options.cas` as `400 check-and-set parameter required for this call`),
-  and injectable LIST errors, plus a `deleteCalls()` counter used to assert
+  `options.cas` as `400 check-and-set parameter required for this call`,
+  and rejecting a wrong `options.cas` VALUE — not merely its presence — as
+  `400 check-and-set parameter did not match the current version`,
+  mirroring `path_data.go:283-288`'s unconditional value check), and
+  injectable LIST errors, plus a `deleteCalls()` counter used to assert
   idempotency (no destination delete+recopy) across repeated migration
   runs.
 - `client/client_test.go` provides a matching `httptest.Server`-backed fake for
@@ -253,7 +256,7 @@ If a flag is omitted, the tool prompts for the missing value at runtime, in the 
 State file stores:
 - Per-secret status (`completed`, `recreated`, `failed`, `skipped`)
 - Version hashes (SHA256)
-- Version state (`active`, `deleted`, `destroyed`, `missing`, `read_error`)
+- Version state (`active`, `deleted`, `destroyed`, `missing`, `read_error`) — `deleted` is set when the source version is confirmed genuinely soft-deleted by an actual failed read (Vault's 404-with-data response for that version), never merely because a `deletion_time` field is present: a future-dated `deletion_time` from `delete_version_after` is non-empty while the version is still fully readable, and that case reads real data and is labeled `active`.
 - Metadata checksum
 - Source and destination version counts — the destination count is **measured** from an actual destination metadata read after copy, not assumed equal to the source count, so it stays accurate even when destination `max_versions` retention prunes below what was written. If that measurement read itself fails, the count falls back to the assumed (source) value and the failure is logged at debug — this bookkeeping never aborts the migration.
 - Summary counters
@@ -296,12 +299,13 @@ After any full or incremental copy (cases 1, 2, and 3), if the destination's mea
 - KV v2 mode only (`-mode kvv2`).
 - Source version timestamps are not preserved on destination.
 - Destroyed source payloads are unrecoverable; tool writes placeholder then marks destination version destroyed.
+- Soft-deleted source payloads are also unrecoverable at read time (Vault returns no data for them); the tool writes the configured placeholder then marks the destination version deleted to match, instead of writing an empty/null payload.
 - Token renewal is not handled; token TTL must exceed migration duration.
 - State file is single-writer; do not share one `-stateFile` across parallel migrations.
 - State file writes are atomic against a killed process (temp file in the same directory + `os.Rename`), but NOT against power loss — there is no `fsync` before the rename, so a hard crash at the wrong instant can still leave a lost (not corrupted) write on some filesystems.
 - Vault client timeout is configurable via `-clientTimeout` (default 60s per request).
 - A source mount/base path that resolves to zero secrets (missing mount, KV v1 mount, typo'd mount or base path) makes the migration fail rather than report success; the SDK cannot distinguish those cases from a genuinely empty mount.
-- **Migrating into a `cas_required` destination is not supported.** Every data write goes through `kv2WriteData`, which sends only `{"data": ...}` and never an `options.cas` value. If the destination secret's own metadata has `cas_required=true`, or the destination mount has its `cas_required` tunable set, Vault's KV v2 plugin rejects the very first version write with `400 check-and-set parameter required for this call`. The migration fails loudly for that secret (no state entry is recorded, and with `-continueOnError` the migration moves on to the next secret) — it does not silently drop data. There is currently no workaround; see the project TODO for design notes on a future fix.
+- Migrating into a `cas_required` destination is supported via a reactive check-and-set retry: `kv2WriteData` sends the same request as always (no `options.cas`) on the first attempt. If — and only if — that write is rejected with `400 check-and-set parameter required for this call` (destination mount tunable OR destination secret's own `cas_required`), it reads the destination's current version via `<mount>/metadata/*` and retries exactly once with `options.cas` set to that version. On every other destination (the overwhelming majority of real runs) this is byte-identical to the pre-existing wire format — no extra request, no `options` key on the write at all. The one-time extra round trip only happens on a `cas_required` destination, and only after the first write already failed. A genuine concurrent-writer CAS mismatch on the retry is not looped — it propagates as a loud failure, same as any other write error. Requires no new token permission: destination `read` on `<mount>/metadata/*` was already required (see Token Policy Requirements above). Verified against a real Vault cluster (`test/e2e/e2e_test.go`'s `TestE2E_CASRequiredMountDestination`, `TestE2E_CASRequiredPerSecretDestination`, `TestE2E_SourceCASRequiredIncremental`), in addition to mock coverage.
 
 ## Security Notes
 

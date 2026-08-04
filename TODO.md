@@ -4,20 +4,25 @@ Active backlog only. Obsolete historical notes removed.
 
 ## Current Baseline (2026-08-04)
 
-- 235 tests passing across 7 packages
-- Coverage: `client` 52.6%, `cmd` 35.3%, `config` 100.0%, `kvv2` 79.4%, `state` 85.5%
+- 258 tests passing across 7 packages (E2E gated behind `E2E_TESTS=1`, 6
+  scenarios verified against a real Vault 1.18.5 cluster this session,
+  not counted in the 258)
+- Coverage: `client` 52.6%, `cmd` 35.3%, `config` 100.0%, `kvv2` 80.6%, `state` 85.5%
 - Phases 1-4 complete (unit, integration, mock harness, E2E)
 - Prompt desync bug fixed: shared `config.Prompt`/`PromptRequired` replaces
   `fmt.Scan`/`bufio.Scanner` mix in `client.go` and `kvv2/init.go`
 - Harness realism lesson: `kvv2/kvv2_mock_test.go` used to be more forgiving
   than real Vault (bare errors instead of 404-with-data for soft-deleted/
   destroyed version reads, no `max_versions` pruning enforcement on write, no
-  `cas_required` enforcement on data writes), so silent-failure bugs (B17's
-  subtree skip, B18, B19) were invisible by construction and the pre-fix
-  `kvv2` coverage number overstated confidence in exactly the paths that
-  mattered most. Mock fidelity is now fixed for 404-with-data, pruning, AND
-  check-and-set enforcement (mount- and secret-level); treat harness realism
-  as a prerequisite before trusting future coverage deltas in this package.
+  `cas_required` enforcement on data writes AT ALL, then only presence- not
+  value-checked once added), so silent-failure bugs (B17's subtree skip,
+  B18, B19) were invisible by construction and the pre-fix `kvv2` coverage
+  number overstated confidence in exactly the paths that mattered most.
+  Mock fidelity is now fixed for 404-with-data, pruning, AND check-and-set
+  enforcement (mount- and secret-level, VALUE-checked against
+  `CurrentVersion` per `path_data.go:283-288`, not just presence-checked);
+  treat harness realism as a prerequisite before trusting future coverage
+  deltas in this package.
 
 ## Active Items
 
@@ -48,10 +53,15 @@ Active backlog only. Obsolete historical notes removed.
   by `kv2MetadataResp` (`kvv2.go` ~106-118). Adding that one field lets a
   missing version be classified as "pruned at source" (`v < oldest_version`)
   vs. "never existed", which this taxonomy needs.
-- Sequence after B18: B18's fix (sentinel `errVersionDataUnavailable`) is
-  what produces the `source_version_unavailable` vs `read_error` distinction
-  as a side effect — doing P4 first would mean redoing the classification
-  once B18 lands.
+- B18 (done): its fix already produces a clean `deleted` (genuinely
+  soft-deleted, confirmed by the read failing) vs `read_error` (a real read
+  failure — network, 5xx, etc.) split in `VersionStates`, as a side effect
+  of the `errVersionDataUnavailable` sentinel. That distinction did NOT
+  need the full reason taxonomy above and was not built out further — P4
+  remains open for the placeholder `_reason` differentiation
+  (`missing_in_metadata`/`source_version_unavailable`/`read_error`/
+  `destroyed`) on the destination payload itself, which is a separate,
+  larger piece of work.
 
 ### P5: Coverage Follow-up (Optional)
 - Improve bootstrap coverage (`main`, `cmd` CLI wiring)
@@ -108,6 +118,16 @@ Active backlog only. Obsolete historical notes removed.
       reordering would additionally trigger it from the SOURCE side any
       time source metadata carries `cas_required=true`, which is strictly
       worse.
+      - **UPDATE (B19 fixed in a later session):** objection #1 above (a
+        reorder would 400 every subsequent write in the same loop) is now
+        RETIRED as a blocker on its own — `kv2WriteData` reactively retries
+        with `options.cas` on a `400 check-and-set parameter required`
+        response, so a `cas_required` destination no longer hard-fails a
+        write. This does NOT reopen B6-iii: objections #2
+        (`delete_version_after` stamped at write time, corrupting replayed
+        history with a live deadline) and #3 (policy — this tool must not
+        silently raise an operator's destination retention config) are
+        unaffected by B19 and STAND on their own. B6-iii REMAINS REJECTED.
     - Second reason: the payload also carries `delete_version_after`,
       computed as the minimum non-zero of mount and per-secret and applied
       AT WRITE TIME (`delete_version_after.go:16-28`,
@@ -139,68 +159,116 @@ Active backlog only. Obsolete historical notes removed.
     delete+recopy -> re-pruned identically -> repeats every run) was the
     most serious item under this bug and is FIXED this session — see
     Completed Snapshot.
-- [ ] B18 (new, verified): 404-with-data bypasses the placeholder path.
-  Vault returns HTTP 404 WITH a `data` body
+- [x] B18 (fixed this session): 404-with-data bypassed the placeholder
+  path. Vault returns HTTP 404 WITH a `data` body
   (`{"data":{"data":null,"metadata":{...}}}`, no `errors`) for a
-  soft-deleted version read. The Vault SDK reports that as SUCCESS
-  (`api/secret.go:364`: `DeepEqual` false -> errors-parsing branch skipped;
-  `api/logical.go:151`: `len(Data) > 0` -> returns `(secret, nil)`), so
-  `kv2ReadVersion` returns `(nil, nil)`. `copySecretFull`/
-  `copyIncrementalVersions` see `rerr == nil`, SKIP the `opts.Placeholder`
-  branch, and write `{"data": null}` to the destination — creating a real
-  destination version whose stored payload is null before it gets
-  soft-deleted to match. It also records an empty-string hash in state for
-  that version. Reachable ONLY for soft-deleted versions; destroyed versions
-  are already guarded by the `vm.Destroyed` pre-check earlier in the same
-  loop. No unrecoverable loss (the data was already unreadable at source),
-  but it bypasses the exact placeholder machinery built for this case.
-  Documented by a passing test,
-  `TestCopyOneSecret_BugA_DeletedVersionReadSucceedsWithEmptyPayload`
-  (`kvv2/kvv2_mock_test.go`), which asserts the CURRENT behavior and must be
-  updated when this is fixed.
-  - Proposed fix: return a sentinel `errVersionDataUnavailable` from
-    `kv2ReadVersion` when `out.Data.Data == nil`; preserve the "deleted"
-    state label in the placeholder branch (do not regress it to
-    `read_error`); make `verifyVersionHashes`/`verifyDestinationMatches`
-    skip that sentinel so it cannot trigger a delete+recopy the way the
-    pre-fix pruning bug used to.
-  - CRITICAL WARNING for whoever picks this up: do NOT "fix" this by
-    skipping reads whenever `DeletionTime != ""`. A future-dated
-    `deletion_time` set via `delete_version_after` is non-empty while the
-    version is STILL READABLE — skipping on that condition would cause
-    genuine loss of live, currently-accessible data. The fix must key off
-    the read actually returning nil data, not off the metadata field alone.
-- [ ] B19 (new, verified this session): migrating INTO a `cas_required`
-  destination fails completely, loudly, on the very first version write.
-  `kv2WriteData` (`kvv2.go:720-730`) sends only `{"data": ...}` — it never
-  sends `options.cas` on any write, for any secret, ever. Real Vault's KV v2
+  soft-deleted version read, which the Vault SDK reported as SUCCESS
+  (`kv2ReadVersion` returned `(nil, nil)`), so `copyOneSecret`/
+  `copySecretFull`/`copyIncrementalVersions` skipped the `opts.Placeholder`
+  branch and wrote `{"data": null}` to the destination. Fixed by returning
+  a new sentinel `errVersionDataUnavailable` from `kv2ReadVersion` when
+  `out.Data.Data == nil`, so every existing `if rerr != nil` placeholder
+  branch fires naturally across all three copy paths.
+  `verifyVersionHashes`/`verifyDestinationMatches` skip that sentinel
+  instead of failing the comparison, so it cannot trigger a delete+recopy
+  loop. A second, closely related bug found and fixed in the same pass: the
+  destination-mirroring `else if vm.DeletionTime != ""` branch (all three
+  copy paths) unconditionally soft-deleted the destination version even
+  when the source read had just succeeded with real, live data (a
+  future-dated `delete_version_after` sets `DeletionTime` while the version
+  stays fully readable) — this actively destroyed correctly-copied live
+  data. Both fixes now key exclusively off whether the read itself
+  produced data, never off `DeletionTime != ""` alone, per the original
+  critical warning. Covered by
+  `TestKV2ReadVersion_SoftDeletedVersionReturnsErrVersionDataUnavailable`,
+  `TestCopyPaths_SoftDeletedVersionGetsPlaceholder` (table-driven across
+  `copyOneSecret`/`copySecretFull`/`copyIncrementalVersions`),
+  `TestKV2ReadVersion_FutureDeletionTimeStillReadsRealData` +
+  `TestCopySecretFull_FutureDeletionTimeCopiesRealData` (the critical-warning
+  regression test), and `TestCopyOneSecretWithState_SoftDeletedVersionIsIdempotent`
+  (re-run performs zero destination deletes). All new tests confirmed to
+  FAIL against the pre-fix `kv2ReadVersion` logic via a stash-based
+  verification before landing.
+- [x] B19 (fixed this session): migrating INTO a `cas_required` destination
+  used to fail completely, loudly, on the very first version write.
+  `kv2WriteData` (`kvv2.go:801-811`) sent only `{"data": ...}` — never
+  `options.cas`, on any write, for any secret, ever. Real Vault's KV v2
   plugin requires check-and-set on every data write when EITHER the
   destination mount's `cas_required` tunable OR the destination secret's
   own per-secret `cas_required` is true
   (`vault-plugin-secrets-kv@v0.26.2/path_data.go:278-288`); a write with no
-  `options.cas` gets a 400 "check-and-set parameter required for this
-  call". This is reachable purely from the DESTINATION side — an operator
-  who independently tunes `cas_required=true` on their destination mount or
-  pre-creates the destination secret with it set (for their own unrelated
-  reasons) makes every subsequent migration into that path/mount fail on
-  version 1, regardless of what the source secret's own `cas_required` is.
-  Not silent — the write error propagates up through
-  `copySecretFull`/`copyIncrementalVersions`/`copyOneSecret` as a returned
-  `error`, and no state entry is recorded for that secret. But it is a hard
-  migration blocker with no workaround today. Exposed by hardening the mock
-  (Task 1, this session — `kvv2/kvv2_mock_test.go`'s `handleData` POST/PUT
-  now enforces the same check real Vault does, where it previously stored
-  `cas_required` but never checked it) and locked by
-  `TestCopySecretFull_CASRequiredDestination_FailsLoudly`, which covers
-  both the per-secret and mount-level trigger. NOT fixed this session per
-  explicit scope (documenting only). Two possible fixes for a future
-  session, not evaluated in depth here: (a) read current version number
-  from a destination metadata GET immediately before each write and pass it
-  as `options.cas`, accepting the extra round trip per version; or (b) skip
-  a preflight destination read and simply attempt cas=0 (create-only) on
-  version 1, escalating to a real version number if the destination secret
-  already exists non-empty. Either needs its own design pass; do not
-  implement ad hoc alongside other changes.
+  `options.cas` got a 400 "check-and-set parameter required for this call".
+  Reachable purely from the DESTINATION side (an operator independently
+  tuning their own destination) and, as a second finding this session, also
+  SELF-INFLICTED from the SOURCE side: `kv2WriteMetadataSettings`
+  (`kvv2.go:839-856`) copies `cas_required` from source metadata
+  UNCONDITIONALLY, after the version-write loop, so a source secret with
+  `cas_required=true` stamps that flag onto the destination as run 1's last
+  step even though run 1 itself succeeded (destination had no
+  `cas_required` yet) — run 2's incremental write then 400s with zero
+  destination-side operator action. Locked by
+  `TestCopySecretFull_SourceCASRequiredSurvivesSecondRun`.
+
+  **Fix — reactive CAS retry, no cached counter:** `kv2WriteData` sends the
+  exact same request as before on the first attempt (no `options` key). If,
+  and only if, that write comes back 400 "check-and-set parameter required"
+  (matched via a narrow, well-documented substring exception to B17's
+  no-substring rule — mismatch and missing-cas are both plain 400 with no
+  structural distinction, see `isCASRequiredError` in `helpers.go`), it
+  reads the destination's current version via `kv2ReadMetadata(...)
+  .Data.CurrentVersion` (already-parsed, previously dead field) and retries
+  EXACTLY ONCE with `options.cas` set to that value — `CurrentVersion`, not
+  `CurrentVersion+1` (the plugin itself advances on success,
+  `path_data.go:267-291`) and not a recomputed `getMaxVersion` (wrong when
+  every version is destroyed or pruned, since destroy/pruning never touch
+  `CurrentVersion`). A missing destination secret reads as `cas=0`. A
+  mismatch on the retry (a genuine concurrent writer) PROPAGATES — no loop,
+  no second retry. A failed seed metadata read (real error, not
+  not-found) never fabricates a cas value; the ORIGINAL CAS-required error
+  propagates with the read failure attached as context. On a destination
+  that never requires CAS — the overwhelming common case — this is
+  byte-identical to the pre-B19 wire format: one write, zero `options` key,
+  zero extra requests, locked by
+  `TestKV2WriteData_NoCASSentWhenNotRequired` and
+  `TestKV2WriteData_NoExtraRequestsWhenNotRequired`.
+
+  Covered by (all confirmed to FAIL pre-fix via stash-based verification):
+  `TestKV2WriteData_CASRequiredRetriesWithCurrentVersion`,
+  `TestKV2WriteData_CASRequiredAllVersionsDestroyed`,
+  `TestKV2WriteData_CASMismatchIsNotRetried`,
+  `TestKV2WriteData_CASSeedMetadataReadFailure`,
+  `TestCopySecretFull_CASRequiredDestination` (renamed from
+  `..._FailsLoudly`, inverted to lock success),
+  `TestCopyIncrementalVersions_CASRequiredDestination`,
+  `TestCopyOneSecret_CASRequiredDestination`,
+  `TestCopyOneSecretWithState_CASRequiredAfterDeleteRecopy` (the
+  stale-cas-after-delete trap: delete+recopy on a `cas_required` mount must
+  seed `cas=0` from a fresh post-delete read, not a cached pre-delete
+  value), and `TestCopySecretFull_SourceCASRequiredSurvivesSecondRun`
+  (the source-side self-inflicted finding above). Common-path regression
+  locks: `TestKV2WriteData_NoCASSentWhenNotRequired`,
+  `TestKV2WriteData_NoExtraRequestsWhenNotRequired`,
+  `TestKV2WriteData_400NonCASNotRetried` (B17 regression lock — an
+  unrelated 400 never triggers the retry),
+  `TestKV2WriteData_Non400ErrorNotRetried` (403/500 propagate immediately,
+  no retry, no metadata read).
+
+  Prerequisite hardening: the mock's CAS check (`kvv2_mock_test.go`) used
+  to validate only that `options.cas` was PRESENT, which would have let an
+  implementation sending a wrong or hardcoded cas value (e.g. always `0`)
+  pass every mock test while failing against real Vault. It now validates
+  the VALUE against the fake secret's `CurrentVersion`, mirroring
+  `path_data.go:283-288` exactly (mismatch vs. missing-cas, both 400 with
+  distinct messages). Proven to bite with a throwaway always-`cas=0`
+  probe against a `CurrentVersion=3` secret (failed as expected, then
+  discarded, not committed).
+
+  E2E-verified against a real Vault 1.18.5 cluster (Docker/podman,
+  `test/e2e/e2e_test.go`): `TestE2E_CASRequiredMountDestination` (the ONLY
+  real-Vault proof of the mount-level OR at `path_data.go:286`),
+  `TestE2E_CASRequiredPerSecretDestination`, and
+  `TestE2E_SourceCASRequiredIncremental`. All three passed on the first
+  E2E run against the fix.
 
 ## Completed Snapshot (Trimmed)
 
@@ -286,9 +354,32 @@ Active backlog only. Obsolete historical notes removed.
   a bare error), enforces per-secret and mount-level `max_versions`
   sliding-window pruning on write, and enforces per-secret and mount-level
   `cas_required` on data writes (rejecting a write with no `options.cas` as
-  400 "check-and-set parameter required for this call", matching
-  `path_data.go:278-288`). The fake used to be more forgiving than real
-  Vault in all three ways, which made pruning-, soft-delete-, and
-  CAS-related bugs invisible by construction; the CAS gap specifically hid
-  B19 (see Active Items) until closed this session.
+  400 "check-and-set parameter required for this call", AND — as of this
+  session's B19 fix, previously presence-only — rejecting a wrong
+  `options.cas` VALUE as 400 "check-and-set parameter did not match the
+  current version", matching `path_data.go:283-288`'s unconditional value
+  check). The fake used to be more forgiving than real Vault in all three
+  ways, which made pruning-, soft-delete-, and CAS-related bugs invisible
+  by construction; the CAS gap specifically hid B19 until closed this
+  session, and the presence-only (not value-checked) CAS gap would have
+  hidden a wrong-cas-value implementation of B19's own fix — proven via a
+  throwaway always-`cas=0` probe that failed once the mock was hardened to
+  check the value, then discarded.
+- B18 (404-with-data null write on soft-deleted versions) fixed: see Active
+  Items entry above for full detail; one-line summary — `kv2ReadVersion`
+  now returns `errVersionDataUnavailable` instead of a silent nil payload,
+  so soft-deleted versions get the configured placeholder everywhere
+  instead of a null write, and a future-dated `delete_version_after` no
+  longer gets misidentified as already-deleted on either the read-skip or
+  destination-mirroring side.
+- B19 (migrating into a `cas_required` destination) fixed: see Active Items
+  entry above for full detail; one-line summary — `kv2WriteData` now
+  reactively retries exactly once with `options.cas` set to the
+  destination's `CurrentVersion` after a "check-and-set parameter
+  required" 400, covering both the destination-side trigger (operator
+  tunes mount or secret `cas_required`) and a newly-found source-side
+  self-inflicted trigger (`kv2WriteMetadataSettings` copies source
+  `cas_required` onto the destination unconditionally); byte-identical to
+  the pre-fix wire format on any destination that never requires CAS.
+  E2E-verified against real Vault 1.18.5.
 </content>
