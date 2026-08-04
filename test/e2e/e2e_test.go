@@ -531,7 +531,9 @@ func TestE2E_DryRun(t *testing.T) {
 
 // setMountCASRequired tunes the destination mount's cas_required option
 // (`vault secrets tune -cas-required=true <mount>/`) via the raw sys/mounts
-// tune API, restoring it to false via t.Cleanup so it never leaks into a
+// tune API. It does NOT register a t.Cleanup itself -- each caller is
+// responsible for restoring cas_required=false (see e.g.
+// TestE2E_CASRequiredMountDestination's t.Cleanup) so it never leaks into a
 // later test in the same suite run.
 func setMountCASRequired(t *testing.T, client *api.Client, mount string, required bool) {
 	t.Helper()

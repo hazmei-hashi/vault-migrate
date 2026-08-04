@@ -29,7 +29,7 @@ var errMetadataNotFound = errors.New("metadata not found")
 // deletion_time (delete_version_after) is non-empty while the version is
 // STILL READABLE with real data; only a nil out.Data.Data means the read
 // actually failed to produce a payload.
-var errVersionDataUnavailable = errors.New("source version data unavailable (soft-deleted or already pruned)")
+var errVersionDataUnavailable = errors.New("source version data unavailable (soft-deleted or destroyed)")
 
 // walkAllKeys returns leaf secret keys relative to the mount
 func (m *Migrator) walkAllKeys(ctx context.Context, c KVV2Cluster, startPrefix string) ([]string, error) {

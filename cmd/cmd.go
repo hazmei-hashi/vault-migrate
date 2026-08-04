@@ -26,7 +26,7 @@ func Init() {
 	flag.StringVar(&c.StateFile, "stateFile", ".vault-migrate-state.json", "Path to state file for tracking migration progress")
 	flag.BoolVar(&c.NoState, "noState", false, "Disable state tracking (legacy mode)")
 	flag.BoolVar(&c.ForceRecopy, "forceRecopy", false, "Re-copy secrets even if hashes match")
-	flag.IntVar(&c.MaxRetries, "maxRetries", 3, "Maximum retry attempts for failed secrets")
+	flag.IntVar(&c.MaxRetries, "maxRetries", 3, "Maximum HTTP retry attempts for Vault API requests (transport-level, honors Retry-After on 429/503)")
 	flag.DurationVar(&c.ClientTimeout, "clientTimeout", 60*time.Second, "HTTP client timeout for Vault API requests")
 	flag.BoolVar(&c.ContinueOnError, "continueOnError", false, "Continue migration even if individual secrets fail")
 	flag.BoolVar(&c.DryRun, "dryRun", false, "Preview migration without making changes")
