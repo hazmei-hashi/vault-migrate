@@ -36,10 +36,14 @@ jobs:
 
       - name: Coverage gate
         run: |
+          set -euo pipefail
           # ponytail: awk on the `total:` line; no coverage-gate action dependency.
           # Ratchet floor — measured 76.3%. Raise this one number as coverage rises; never above current.
           THRESHOLD=73
           total=$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}' | tr -d '%')
+          if [ -z "$total" ]; then
+            echo "::error::failed to parse total coverage from coverage.out"; exit 1
+          fi
           echo "Total coverage: ${total}% (threshold ${THRESHOLD}%)"
           awk -v t="$total" -v th="$THRESHOLD" 'BEGIN { exit (t+0 < th+0) }' \
             || { echo "::error::coverage ${total}% below threshold ${THRESHOLD}%"; exit 1; }
