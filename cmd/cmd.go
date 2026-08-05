@@ -101,7 +101,7 @@ func validateConfig(c config.VaultClientConfig) error {
 		return fmt.Errorf("clientTimeout must be > 0")
 	}
 
-	if c.StateFile == "" && !c.NoState {
+	if c.StateFile == "" && !c.NoState && !c.Rollback {
 		return fmt.Errorf("stateFile cannot be empty when state tracking is enabled")
 	}
 
