@@ -11,10 +11,11 @@ import (
 
 // Canonical placeholder reason strings (DECISION A: one vocabulary everywhere).
 const (
-	ReasonMissingInMetadata       = "missing_in_metadata"
+	ReasonMissingInMetadata        = "missing_in_metadata"
 	ReasonSourceVersionUnavailable = "source_version_unavailable"
-	ReasonDestroyed               = "destroyed"
-	ReasonReadError               = "read_error"
+	ReasonDestroyed                = "destroyed"
+	ReasonReadError                = "read_error"
+	ReasonActive                   = "active"
 )
 
 // Missing subtype strings for ReasonMissingInMetadata.
@@ -47,6 +48,9 @@ func classifyPlaceholderReason(present, destroyed bool, rerr error, v, oldestVer
 	}
 	if destroyed {
 		return ReasonDestroyed, ""
+	}
+	if rerr == nil {
+		return ReasonActive, "" // Row 6: live version, no placeholder
 	}
 	if errors.Is(rerr, errVersionDataUnavailable) {
 		return ReasonSourceVersionUnavailable, ""

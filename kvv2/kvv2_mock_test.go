@@ -3104,6 +3104,17 @@ func TestClassifyPlaceholderReason(t *testing.T) {
 			v: 1, oldestVersion: 0,
 			wantReason: ReasonReadError, wantSubtype: "",
 		},
+		// Row 6: in map, !Destroyed, rerr==nil -> active (no placeholder)
+		{
+			name:          "active_nil_rerr",
+			present:       true,
+			destroyed:     false,
+			rerr:          nil,
+			v:             1,
+			oldestVersion: 0,
+			wantReason:    ReasonActive,
+			wantSubtype:   "",
+		},
 	}
 
 	for _, tt := range tests {

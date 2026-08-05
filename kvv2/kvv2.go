@@ -410,7 +410,7 @@ func (m *Migrator) copySecretFull(ctx context.Context, srcKey, dstKey string, sr
 				// while the version stays fully readable. Never key off
 				// DeletionTime here; the read outcome is authoritative.
 				payload = p
-				versionState = "active"
+				versionState = ReasonActive
 
 				hash, err := state.HashPayload(payload)
 				if err != nil {
@@ -544,7 +544,7 @@ func (m *Migrator) copyIncrementalVersions(ctx context.Context, srcKey, dstKey s
 				// regardless of vm.DeletionTime (future-dated
 				// delete_version_after). Never key off DeletionTime here.
 				payload = p
-				versionState = "active"
+				versionState = ReasonActive
 
 				hash, err := state.HashPayload(payload)
 				if err != nil {

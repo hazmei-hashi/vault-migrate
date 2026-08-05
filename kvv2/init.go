@@ -181,13 +181,13 @@ func (m *Migrator) Run(ctx context.Context, opts Options) error {
 			"_vault_migrate": "placeholder",
 			// _reason is intentionally absent here: the per-version reason
 			// is computed by classifyPlaceholderReason and injected via
-			// placeholderPayload at each copy site. The default opts.Placeholder
-			// is only used as a fallback marker when a copy site needs a non-nil
-			// value before classifyPlaceholderReason is available (e.g. the
-			// destroyed branch in copyOneSecret which still goes through this map).
-			// All three copy paths now build per-version payloads; this default
-			// is kept for backward compatibility with callers that supply their
-			// own Placeholder. (P4: hardcoded-reason bug fixed)
+			// placeholderPayload at each copy site. All three internal copy
+			// paths (copyOneSecret and its version loops) always build payloads
+			// via placeholderPayload and never read opts.Placeholder at runtime.
+			// This default map is a legacy fallback kept for backward
+			// compatibility: external callers that supply their own
+			// opts.Placeholder will have it respected; the internal paths ignore
+			// it. (P4: hardcoded-reason bug fixed)
 		}
 	}
 
