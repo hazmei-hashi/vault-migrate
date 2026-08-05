@@ -65,7 +65,7 @@ func runMode(c config.VaultClientConfig, src, dst *api.Client) error {
 		}
 		return kvv2.Init(src, dst, c)
 	default:
-		return fmt.Errorf("unsupported mode: %s (supported: kvv2)", c.Mode)
+		return fmt.Errorf("unsupported mode: %q (supported: kvv2)", c.Mode)
 	}
 }
 
