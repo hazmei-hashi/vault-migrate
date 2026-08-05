@@ -9,6 +9,67 @@ import (
 	"github.com/hashicorp/vault/api"
 )
 
+// Canonical placeholder reason strings (DECISION A: one vocabulary everywhere).
+const (
+	ReasonMissingInMetadata       = "missing_in_metadata"
+	ReasonSourceVersionUnavailable = "source_version_unavailable"
+	ReasonDestroyed               = "destroyed"
+	ReasonReadError               = "read_error"
+)
+
+// Missing subtype strings for ReasonMissingInMetadata.
+const (
+	SubtypePrunedAtSource = "pruned_at_source"
+	SubtypeNeverExisted   = "never_existed"
+)
+
+// classifyPlaceholderReason returns the canonical reason (and, for
+// missing_in_metadata, a subtype) for a version that did not produce a real
+// payload. Mirrors the decision table in the P4 plan:
+//
+//  1. NOT in Versions, oldestVersion>0 && v<oldestVersion -> missing_in_metadata / pruned_at_source
+//  2. NOT in Versions, else                               -> missing_in_metadata / never_existed
+//  3. in Versions, Destroyed=true                         -> destroyed
+//  4. in Versions, !Destroyed, rerr==errVersionDataUnavailable -> source_version_unavailable
+//  5. in Versions, !Destroyed, rerr==other error          -> read_error
+//  6. in Versions, !Destroyed, rerr==nil                  -> "active" (no placeholder)
+//
+// present=false means the version key was absent from the Versions map.
+// destroyed=true is only meaningful when present=true.
+// rerr is only inspected when present=true && !destroyed.
+// oldestVersion==0 must fall through to never_existed (never guess pruned).
+func classifyPlaceholderReason(present, destroyed bool, rerr error, v, oldestVersion int) (reason, missingSubtype string) {
+	if !present {
+		if oldestVersion > 0 && v < oldestVersion {
+			return ReasonMissingInMetadata, SubtypePrunedAtSource
+		}
+		return ReasonMissingInMetadata, SubtypeNeverExisted
+	}
+	if destroyed {
+		return ReasonDestroyed, ""
+	}
+	if errors.Is(rerr, errVersionDataUnavailable) {
+		return ReasonSourceVersionUnavailable, ""
+	}
+	// rerr != nil but NOT the sentinel -> transient read error
+	return ReasonReadError, ""
+}
+
+// placeholderPayload builds the canonical placeholder map for a version.
+// Always includes _vault_migrate, _source_version, and _reason.
+// Adds _missing_subtype only when subtype is non-empty.
+func placeholderPayload(reason, subtype string, v int) map[string]any {
+	p := map[string]any{
+		"_vault_migrate":  "placeholder",
+		"_source_version": v,
+		"_reason":         reason,
+	}
+	if subtype != "" {
+		p["_missing_subtype"] = subtype
+	}
+	return p
+}
+
 func (m *Migrator) dstKeyFor(srcRelKey string) string {
 	srcRelKey = trimSlashes(srcRelKey)
 	srcBase := trimSlashes(m.Src.BasePath)

@@ -67,7 +67,7 @@ func TestMigrationState_Save_Load(t *testing.T) {
 		},
 		VersionStates: map[string]string{
 			"1": "active",
-			"2": "deleted",
+			"2": "source_version_unavailable",
 		},
 		MetadataChecksum: "sha256:meta123",
 		MigratedAt:       "2026-05-01T10:00:00Z",

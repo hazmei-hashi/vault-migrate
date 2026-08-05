@@ -129,6 +129,7 @@ type kv2MetadataResp struct {
 		CurrentVersion     int               `json:"current_version"`
 		DeleteVersionAfter string            `json:"delete_version_after"`
 		MaxVersions        int               `json:"max_versions"`
+		OldestVersion      int               `json:"oldest_version"`
 		CustomMetadata     map[string]string `json:"custom_metadata"`
 		Versions           map[string]struct {
 			DeletionTime string `json:"deletion_time"`
@@ -164,11 +165,10 @@ func (m *Migrator) copyOneSecret(ctx context.Context, srcKey, dstKey string, opt
 	for v := 1; v <= maxV; v++ {
 		vm, ok := meta.Data.Versions[strconv.Itoa(v)]
 		if !ok {
-			if err := m.kv2WriteData(ctx, m.Dst, dstKey, map[string]any{
-				"_vault_migrate":  "placeholder",
-				"_source_version": v,
-				"_reason":         "missing_in_metadata",
-			}); err != nil {
+			// P4: classify missing version with subtype (pruned vs never existed)
+			reason, subtype := classifyPlaceholderReason(false, false, nil, v, meta.Data.OldestVersion)
+			m.Logger.Debug("placeholder", "key", srcKey, "version", v, "reason", reason)
+			if err := m.kv2WriteData(ctx, m.Dst, dstKey, placeholderPayload(reason, subtype, v)); err != nil {
 				return fmt.Errorf("write placeholder v=%d: %w", v, err)
 			}
 			continue
@@ -177,11 +177,21 @@ func (m *Migrator) copyOneSecret(ctx context.Context, srcKey, dstKey string, opt
 		var payload map[string]any
 		var readFailed bool
 		if vm.Destroyed {
-			payload = opts.Placeholder
+			// P4: per-version destroyed placeholder
+			reason, _ := classifyPlaceholderReason(true, true, nil, v, meta.Data.OldestVersion)
+			m.Logger.Debug("placeholder", "key", srcKey, "version", v, "reason", reason)
+			payload = placeholderPayload(reason, "", v)
 		} else {
 			p, rerr := m.kv2ReadVersion(ctx, m.Src, srcKey, v)
 			if rerr != nil {
-				payload = opts.Placeholder
+				// P4: distinguish source_version_unavailable from read_error
+				reason, _ := classifyPlaceholderReason(true, false, rerr, v, meta.Data.OldestVersion)
+				if reason == ReasonReadError {
+					m.Logger.Warn("placeholder read_error", "key", srcKey, "version", v, "err", rerr)
+				} else {
+					m.Logger.Debug("placeholder", "key", srcKey, "version", v, "reason", reason)
+				}
+				payload = placeholderPayload(reason, "", v)
 				// Gate readFailed on the sentinel: only a genuine soft-delete
 				// (errVersionDataUnavailable) should mirror a delete onto the
 				// destination. A transient error (5xx, timeout, perms) leaves
@@ -350,14 +360,13 @@ func (m *Migrator) copySecretFull(ctx context.Context, srcKey, dstKey string, sr
 	for v := 1; v <= maxV; v++ {
 		vm, ok := srcMeta.Data.Versions[strconv.Itoa(v)]
 		if !ok {
-			if err := m.kv2WriteData(ctx, m.Dst, dstKey, map[string]any{
-				"_vault_migrate":  "placeholder",
-				"_source_version": v,
-				"_reason":         "missing_in_metadata",
-			}); err != nil {
+			// P4: classify missing version with subtype (pruned vs never existed)
+			reason, subtype := classifyPlaceholderReason(false, false, nil, v, srcMeta.Data.OldestVersion)
+			m.Logger.Debug("placeholder", "key", srcKey, "version", v, "reason", reason)
+			if err := m.kv2WriteData(ctx, m.Dst, dstKey, placeholderPayload(reason, subtype, v)); err != nil {
 				return fmt.Errorf("write placeholder v=%d: %w", v, err)
 			}
-			versionStates[strconv.Itoa(v)] = "missing"
+			versionStates[strconv.Itoa(v)] = ReasonMissingInMetadata
 			continue
 		}
 
@@ -366,12 +375,24 @@ func (m *Migrator) copySecretFull(ctx context.Context, srcKey, dstKey string, sr
 		var readFailed bool
 
 		if vm.Destroyed {
-			payload = opts.Placeholder
-			versionState = "destroyed"
+			// P4: per-version destroyed placeholder
+			reason, _ := classifyPlaceholderReason(true, true, nil, v, srcMeta.Data.OldestVersion)
+			m.Logger.Debug("placeholder", "key", srcKey, "version", v, "reason", reason)
+			payload = placeholderPayload(reason, "", v)
+			versionState = ReasonDestroyed
 		} else {
 			p, rerr := m.kv2ReadVersion(ctx, m.Src, srcKey, v)
 			if rerr != nil {
-				payload = opts.Placeholder
+				// P4: distinguish source_version_unavailable from read_error
+				reason, _ := classifyPlaceholderReason(true, false, rerr, v, srcMeta.Data.OldestVersion)
+				if reason == ReasonReadError {
+					// DECISION B: read_error at Warn so a possibly-transient
+					// failure baked into the destination is loud.
+					m.Logger.Warn("placeholder read_error", "key", srcKey, "version", v, "err", rerr)
+				} else {
+					m.Logger.Debug("placeholder", "key", srcKey, "version", v, "reason", reason)
+				}
+				payload = placeholderPayload(reason, "", v)
 				// Gate readFailed on the sentinel: only a genuine soft-delete
 				// (errVersionDataUnavailable) mirrors a delete onto the
 				// destination. Transient errors keep the placeholder readable.
@@ -381,11 +402,7 @@ func (m *Migrator) copySecretFull(ctx context.Context, srcKey, dstKey string, sr
 				// triggered it -- an explicit delete, or a past
 				// delete_version_after deadline). Any other error is a
 				// real read failure (network, 5xx, etc.), not a delete.
-				if errors.Is(rerr, errVersionDataUnavailable) {
-					versionState = "deleted"
-				} else {
-					versionState = "read_error"
-				}
+				versionState = reason
 			} else {
 				// B18 CRITICAL: the read succeeded with real data, so
 				// this version is live REGARDLESS of vm.DeletionTime --
@@ -481,14 +498,13 @@ func (m *Migrator) copyIncrementalVersions(ctx context.Context, srcKey, dstKey s
 	for v := startVersion; v <= endVersion; v++ {
 		vm, ok := srcMeta.Data.Versions[strconv.Itoa(v)]
 		if !ok {
-			if err := m.kv2WriteData(ctx, m.Dst, dstKey, map[string]any{
-				"_vault_migrate":  "placeholder",
-				"_source_version": v,
-				"_reason":         "missing_in_metadata",
-			}); err != nil {
+			// P4: classify missing version with subtype (pruned vs never existed)
+			reason, subtype := classifyPlaceholderReason(false, false, nil, v, srcMeta.Data.OldestVersion)
+			m.Logger.Debug("placeholder", "key", srcKey, "version", v, "reason", reason)
+			if err := m.kv2WriteData(ctx, m.Dst, dstKey, placeholderPayload(reason, subtype, v)); err != nil {
 				return fmt.Errorf("write placeholder v=%d: %w", v, err)
 			}
-			versionStates[strconv.Itoa(v)] = "missing"
+			versionStates[strconv.Itoa(v)] = ReasonMissingInMetadata
 			continue
 		}
 
@@ -497,12 +513,24 @@ func (m *Migrator) copyIncrementalVersions(ctx context.Context, srcKey, dstKey s
 		var readFailed bool
 
 		if vm.Destroyed {
-			payload = opts.Placeholder
-			versionState = "destroyed"
+			// P4: per-version destroyed placeholder
+			reason, _ := classifyPlaceholderReason(true, true, nil, v, srcMeta.Data.OldestVersion)
+			m.Logger.Debug("placeholder", "key", srcKey, "version", v, "reason", reason)
+			payload = placeholderPayload(reason, "", v)
+			versionState = ReasonDestroyed
 		} else {
 			p, rerr := m.kv2ReadVersion(ctx, m.Src, srcKey, v)
 			if rerr != nil {
-				payload = opts.Placeholder
+				// P4: distinguish source_version_unavailable from read_error
+				reason, _ := classifyPlaceholderReason(true, false, rerr, v, srcMeta.Data.OldestVersion)
+				if reason == ReasonReadError {
+					// DECISION B: read_error at Warn so a possibly-transient
+					// failure baked into the destination is loud.
+					m.Logger.Warn("placeholder read_error", "key", srcKey, "version", v, "err", rerr)
+				} else {
+					m.Logger.Debug("placeholder", "key", srcKey, "version", v, "reason", reason)
+				}
+				payload = placeholderPayload(reason, "", v)
 				// Gate readFailed on the sentinel: only a genuine soft-delete
 				// (errVersionDataUnavailable) mirrors a delete onto the
 				// destination. Transient errors keep the placeholder readable.
@@ -510,11 +538,7 @@ func (m *Migrator) copyIncrementalVersions(ctx context.Context, srcKey, dstKey s
 				// B18: see copySecretFull -- errVersionDataUnavailable is
 				// Vault's own signal this version is genuinely
 				// soft-deleted; any other error is a real read failure.
-				if errors.Is(rerr, errVersionDataUnavailable) {
-					versionState = "deleted"
-				} else {
-					versionState = "read_error"
-				}
+				versionState = reason
 			} else {
 				// B18 CRITICAL: read succeeded with real data -> live
 				// regardless of vm.DeletionTime (future-dated

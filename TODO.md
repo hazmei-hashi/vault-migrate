@@ -52,26 +52,31 @@ only ever be a coarse throttle the existing transport-layer
 behavior is correct as-is. If a real workload ever proves CLI-bound (not
 Vault-bound), revisit — but measure first.
 
-### P4: Placeholder Differentiation
-- Distinguish placeholder reasons clearly:
-  - `missing_in_metadata`
-  - `source_version_unavailable`
-  - `read_error`
-  - `destroyed`
-- Improve logs/state to reflect exact reason paths
-- `oldest_version` from the KV v2 metadata response is not currently parsed
-  by `kv2MetadataResp` (`kvv2.go` ~106-118). Adding that one field lets a
-  missing version be classified as "pruned at source" (`v < oldest_version`)
-  vs. "never existed", which this taxonomy needs.
-- B18 (done): its fix already produces a clean `deleted` (genuinely
-  soft-deleted, confirmed by the read failing) vs `read_error` (a real read
-  failure — network, 5xx, etc.) split in `VersionStates`, as a side effect
-  of the `errVersionDataUnavailable` sentinel. That distinction did NOT
-  need the full reason taxonomy above and was not built out further — P4
-  remains open for the placeholder `_reason` differentiation
-  (`missing_in_metadata`/`source_version_unavailable`/`read_error`/
-  `destroyed`) on the destination payload itself, which is a separate,
-  larger piece of work.
+### [x] P4: Placeholder Differentiation (DONE)
+- [x] Distinguish placeholder `_reason` on destination payload — 4 canonical values:
+  `missing_in_metadata` / `source_version_unavailable` / `read_error` / `destroyed`
+- [x] `oldest_version` parsed into `kv2MetadataResp.Data` (`kvv2.go`); fake mock
+  computes and serves it via `pruneVersions` / metadata GET response. Enables
+  missing versions to be classified as `pruned_at_source` (`v < oldest_version`)
+  vs. `never_existed` via `_missing_subtype` field on the placeholder payload.
+- [x] DECISION A (unified vocab): collapsed VersionStates to the 4 canonical reason
+  strings + `"active"`. Old labels `"deleted"` → `"source_version_unavailable"`,
+  `"missing"` → `"missing_in_metadata"`. All test assertions updated.
+- [x] DECISION B (read_error handling): write-placeholder-and-continue kept (no
+  abort, B18/B19 mirror-delete gate unchanged). `read_error` logged at Warn (not
+  Debug) so a possibly-transient failure baked into the destination is loud.
+- [x] `classifyPlaceholderReason` + `placeholderPayload` pure helpers in
+  `helpers.go`; const strings exported for test assertions.
+- [x] Hardcoded `_reason:"source_version_unavailable"` in `init.go` default
+  placeholder fixed — all 3 copy paths now compute per-version reason via
+  `classifyPlaceholderReason` and build per-version payloads via `placeholderPayload`.
+  Every placeholder now carries `_source_version`.
+- [x] New tests: `TestClassifyPlaceholderReason`, `TestCopyPaths_PlaceholderReasons`,
+  `TestCopyPaths_PrunedAtSource_MissingSubtype`,
+  `TestCopySecretFull_ReadErrorNoMirroredDelete`.
+- [x] Known gap (out-of-scope, flagged): `copyOneSecret` stateless path has no
+  self-heal for a transient `read_error` baked into the destination on a previous
+  run. Re-run in stateful mode or delete and re-migrate the affected secret.
 
 ### P5: Coverage Follow-up (Optional)
 - Improve bootstrap coverage (`main`, `cmd` CLI wiring)

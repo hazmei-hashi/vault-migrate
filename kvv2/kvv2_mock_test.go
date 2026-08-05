@@ -38,6 +38,7 @@ type fakeKVSecret struct {
 	CustomMetadata     map[string]string
 	Versions           map[int]*fakeKVVersion
 	CurrentVersion     int
+	OldestVersion      int // mirrors KV v2 metadata.oldest_version (set by pruneVersions)
 }
 
 type fakeVault struct {
@@ -181,6 +182,9 @@ const defaultMaxVersions = 10
 // soft-deleted -- gone, same as real Vault's storage GC for pruned versions).
 // Effective retention = max(per-secret MaxVersions, mount-level
 // mountMaxVersions), falling back to defaultMaxVersions when both are 0.
+// Also sets sec.OldestVersion to mirror real Vault's metadata.oldest_version
+// field (the version number one ABOVE the oldest pruned version, i.e. the
+// lowest version number still present in the Versions map after pruning).
 // Caller must hold f.mu.
 func (f *fakeVault) pruneVersions(sec *fakeKVSecret) {
 	effective := sec.MaxVersions
@@ -192,6 +196,7 @@ func (f *fakeVault) pruneVersions(sec *fakeKVSecret) {
 	}
 
 	if len(sec.Versions) <= effective {
+		// No pruning needed; oldest_version stays at its current value or 0.
 		return
 	}
 
@@ -201,6 +206,10 @@ func (f *fakeVault) pruneVersions(sec *fakeKVSecret) {
 			delete(sec.Versions, v)
 		}
 	}
+	// oldest_version = oldest+1 = the lowest version number still in the map.
+	// Real Vault sets this to oldest+1 (the first version that survived the
+	// sliding window). If nothing was pruned above, this branch is unreachable.
+	sec.OldestVersion = oldest + 1
 }
 
 func (f *fakeVault) putVersion(key string, data map[string]any) int {
@@ -706,6 +715,7 @@ func (f *fakeVault) handleMetadata(w http.ResponseWriter, r *http.Request, relKe
 				"current_version":      sec.CurrentVersion,
 				"delete_version_after": sec.DeleteVersionAfter,
 				"max_versions":         sec.MaxVersions,
+				"oldest_version":       sec.OldestVersion,
 				"custom_metadata":      sec.CustomMetadata,
 				"versions":             versions,
 			},
@@ -1518,9 +1528,10 @@ func TestKV2ReadVersion_SoftDeletedVersionReturnsErrVersionDataUnavailable(t *te
 
 // TestCopyPaths_SoftDeletedVersionGetsPlaceholder is B18's end-to-end proof
 // across all three copy paths: a soft-deleted source version must produce
-// the configured placeholder on the destination (with "_reason" present),
+// a placeholder on the destination (with "_reason":"source_version_unavailable"),
 // never a null/empty payload, and the state label for that version must
-// stay "deleted" (copySecretFull/copyIncrementalVersions only -- copyOneSecret
+// stay "source_version_unavailable" (DECISION A canonical vocab;
+// copySecretFull/copyIncrementalVersions only -- copyOneSecret
 // does not track VersionStates at all).
 func TestCopyPaths_SoftDeletedVersionGetsPlaceholder(t *testing.T) {
 	placeholder := map[string]any{
@@ -1597,8 +1608,9 @@ func TestCopyPaths_SoftDeletedVersionGetsPlaceholder(t *testing.T) {
 			}
 
 			if versionStates != nil {
-				if got := versionStates["1"]; got != "deleted" {
-					t.Fatalf("VersionStates[\"1\"] = %q, want \"deleted\" (must not regress to read_error)", got)
+				// DECISION A: canonical vocab -- "deleted" renamed to "source_version_unavailable"
+				if got := versionStates["1"]; got != "source_version_unavailable" {
+					t.Fatalf("VersionStates[\"1\"] = %q, want \"source_version_unavailable\" (must not regress to read_error)", got)
 				}
 			}
 
@@ -3025,5 +3037,361 @@ func TestCopySecretFull_SourceCASRequiredSurvivesSecondRun(t *testing.T) {
 	}
 	if v2["value"] != "v2" {
 		t.Fatalf("dst v2 value = %v, want v2", v2["value"])
+	}
+}
+
+// TestClassifyPlaceholderReason covers all 6 decision-table rows plus both
+// missing subtypes (pruned_at_source and never_existed).
+func TestClassifyPlaceholderReason(t *testing.T) {
+	otherErr := errors.New("some transient error")
+
+	tests := []struct {
+		name           string
+		present        bool
+		destroyed      bool
+		rerr           error
+		v              int
+		oldestVersion  int
+		wantReason     string
+		wantSubtype    string
+	}{
+		// Row 1: NOT in map, oldestVersion > 0 && v < oldestVersion -> pruned_at_source
+		{
+			name: "missing_pruned",
+			present: false, destroyed: false, rerr: nil,
+			v: 3, oldestVersion: 5,
+			wantReason: ReasonMissingInMetadata, wantSubtype: SubtypePrunedAtSource,
+		},
+		// Row 2a: NOT in map, oldestVersion == 0 -> never_existed (not guessing pruned)
+		{
+			name: "missing_never_existed_oldestZero",
+			present: false, destroyed: false, rerr: nil,
+			v: 3, oldestVersion: 0,
+			wantReason: ReasonMissingInMetadata, wantSubtype: SubtypeNeverExisted,
+		},
+		// Row 2b: NOT in map, v >= oldestVersion -> never_existed
+		{
+			name: "missing_never_existed_vAboveOldest",
+			present: false, destroyed: false, rerr: nil,
+			v: 6, oldestVersion: 5,
+			wantReason: ReasonMissingInMetadata, wantSubtype: SubtypeNeverExisted,
+		},
+		// Row 2c: NOT in map, oldestVersion > 0 but v == oldestVersion -> never_existed (boundary)
+		{
+			name: "missing_never_existed_vEqualsOldest",
+			present: false, destroyed: false, rerr: nil,
+			v: 5, oldestVersion: 5,
+			wantReason: ReasonMissingInMetadata, wantSubtype: SubtypeNeverExisted,
+		},
+		// Row 3: in map, Destroyed=true -> destroyed
+		{
+			name: "destroyed",
+			present: true, destroyed: true, rerr: nil,
+			v: 1, oldestVersion: 0,
+			wantReason: ReasonDestroyed, wantSubtype: "",
+		},
+		// Row 4: in map, !Destroyed, rerr==errVersionDataUnavailable -> source_version_unavailable
+		{
+			name: "soft_deleted",
+			present: true, destroyed: false, rerr: errVersionDataUnavailable,
+			v: 1, oldestVersion: 0,
+			wantReason: ReasonSourceVersionUnavailable, wantSubtype: "",
+		},
+		// Row 5: in map, !Destroyed, rerr==other error -> read_error
+		{
+			name: "read_error",
+			present: true, destroyed: false, rerr: otherErr,
+			v: 1, oldestVersion: 0,
+			wantReason: ReasonReadError, wantSubtype: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotReason, gotSubtype := classifyPlaceholderReason(tt.present, tt.destroyed, tt.rerr, tt.v, tt.oldestVersion)
+			if gotReason != tt.wantReason {
+				t.Errorf("reason = %q, want %q", gotReason, tt.wantReason)
+			}
+			if gotSubtype != tt.wantSubtype {
+				t.Errorf("subtype = %q, want %q", gotSubtype, tt.wantSubtype)
+			}
+		})
+	}
+}
+
+// TestCopyPaths_PlaceholderReasons asserts that each placeholder scenario
+// (destroyed, soft-deleted, read_error) writes a _reason payload AND records
+// the correct canonical VersionStates label across copySecretFull and
+// copyIncrementalVersions. copyOneSecret records no state but still writes
+// correct _reason payloads.
+func TestCopyPaths_PlaceholderReasons(t *testing.T) {
+	type scenario struct {
+		name        string
+		setup       func(src *fakeVault, key string)
+		wantReason  string
+		wantDeleted bool // dst version soft-deleted to mirror src?
+	}
+
+	scenarios := []scenario{
+		{
+			name: "destroyed",
+			setup: func(src *fakeVault, key string) {
+				src.putVersion(key, map[string]any{"value": "v1"})
+				src.markVersionDestroyed(key, 1)
+			},
+			wantReason:  ReasonDestroyed,
+			wantDeleted: false, // destroyed, not soft-deleted
+		},
+		{
+			name: "soft_deleted_source_version_unavailable",
+			setup: func(src *fakeVault, key string) {
+				src.putVersion(key, map[string]any{"value": "v1"})
+				src.markVersionDeleted(key, 1)
+			},
+			wantReason:  ReasonSourceVersionUnavailable,
+			wantDeleted: true, // mirror delete
+		},
+		// read_error: no mirror delete, placeholder readable
+		{
+			name: "read_error",
+			setup: func(src *fakeVault, key string) {
+				src.putVersion(key, map[string]any{"value": "v1"})
+				src.setForceDataReadError(key, 500, "injected transient read error")
+			},
+			wantReason:  ReasonReadError,
+			wantDeleted: false, // NOT mirrored
+		},
+	}
+
+	copyPaths := []struct {
+		name string
+		run  func(t *testing.T, m *Migrator, srcMeta *kv2MetadataResp, key string, dst *fakeVault) map[string]string
+	}{
+		{
+			name: "copySecretFull",
+			run: func(t *testing.T, m *Migrator, srcMeta *kv2MetadataResp, key string, dst *fakeVault) map[string]string {
+				t.Helper()
+				if err := m.copySecretFull(context.Background(), key, key, srcMeta, Options{}); err != nil {
+					t.Fatalf("copySecretFull failed: %v", err)
+				}
+				return m.State.GetSecret(key).VersionStates
+			},
+		},
+		{
+			name: "copyIncrementalVersions",
+			run: func(t *testing.T, m *Migrator, srcMeta *kv2MetadataResp, key string, dst *fakeVault) map[string]string {
+				t.Helper()
+				if err := m.copyIncrementalVersions(context.Background(), key, key, srcMeta, 1, 1, Options{}); err != nil {
+					t.Fatalf("copyIncrementalVersions failed: %v", err)
+				}
+				return m.State.GetSecret(key).VersionStates
+			},
+		},
+		{
+			name: "copyOneSecret",
+			run: func(t *testing.T, m *Migrator, _ *kv2MetadataResp, key string, dst *fakeVault) map[string]string {
+				t.Helper()
+				if err := m.copyOneSecret(context.Background(), key, key, Options{}); err != nil {
+					t.Fatalf("copyOneSecret failed: %v", err)
+				}
+				return nil // no VersionStates on stateless path
+			},
+		},
+	}
+
+	for _, sc := range scenarios {
+		for _, cp := range copyPaths {
+			t.Run(sc.name+"/"+cp.name, func(t *testing.T) {
+				src := newFakeVault(t)
+				dst := newFakeVault(t)
+				key := "app/p4/" + sc.name
+
+				sc.setup(src, key)
+
+				m := newTestMigrator(t, src, dst, true)
+
+				srcMeta, err := m.kv2ReadMetadata(context.Background(), m.Src, key)
+				if err != nil {
+					t.Fatalf("kv2ReadMetadata src failed: %v", err)
+				}
+
+				versionStates := cp.run(t, m, srcMeta, key, dst)
+
+				// Assert _reason in written payload
+				payload := dst.rawVersionData(key, 1)
+				if payload == nil {
+					t.Fatalf("dst v1 has no stored payload")
+				}
+				if got := payload["_reason"]; got != sc.wantReason {
+					t.Errorf("payload _reason = %q, want %q", got, sc.wantReason)
+				}
+				if payload["_vault_migrate"] != "placeholder" {
+					t.Errorf("payload _vault_migrate = %q, want placeholder", payload["_vault_migrate"])
+				}
+
+				// Assert VersionStates on stateful paths
+				if versionStates != nil {
+					if got := versionStates["1"]; got != sc.wantReason {
+						t.Errorf("VersionStates[\"1\"] = %q, want %q", got, sc.wantReason)
+					}
+				}
+
+				// Assert mirror-delete behavior
+				dstMeta, err := m.kv2ReadMetadata(context.Background(), m.Dst, key)
+				if err != nil {
+					t.Fatalf("kv2ReadMetadata dst failed: %v", err)
+				}
+				v1meta, ok := dstMeta.Data.Versions["1"]
+				if !ok {
+					t.Fatalf("dst v1 not found in metadata")
+				}
+				isDeleted := v1meta.DeletionTime != ""
+				if isDeleted != sc.wantDeleted {
+					t.Errorf("dst v1 soft-deleted = %v, want %v", isDeleted, sc.wantDeleted)
+				}
+			})
+		}
+	}
+}
+
+// TestCopyPaths_PrunedAtSource_MissingSubtype asserts that when a source
+// secret has early versions pruned by max_versions, the absent versions get
+// a placeholder with _reason:"missing_in_metadata" AND
+// _missing_subtype:"pruned_at_source" (not "never_existed"), verified via
+// oldest_version from the fake's metadata response.
+func TestCopyPaths_PrunedAtSource_MissingSubtype(t *testing.T) {
+	src := newFakeVault(t)
+	dst := newFakeVault(t)
+
+	// Set max_versions=2 on the mount so pruning fires on write.
+	// Write 4 versions: v1,v2 get pruned, v3,v4 survive.
+	src.setMountMaxVersions(2)
+	key := "app/pruned"
+	src.putVersion(key, map[string]any{"value": "v1"}) // pruned
+	src.putVersion(key, map[string]any{"value": "v2"}) // pruned
+	src.putVersion(key, map[string]any{"value": "v3"}) // survives
+	src.putVersion(key, map[string]any{"value": "v4"}) // survives (current)
+
+	m := newTestMigrator(t, src, dst, true)
+
+	srcMeta, err := m.kv2ReadMetadata(context.Background(), m.Src, key)
+	if err != nil {
+		t.Fatalf("kv2ReadMetadata src failed: %v", err)
+	}
+	// Sanity: oldest_version must be > 0 for subtype classification to fire.
+	if srcMeta.Data.OldestVersion == 0 {
+		t.Fatalf("srcMeta.OldestVersion == 0; fake mock did not set oldest_version (need pruning to have fired)")
+	}
+	if srcMeta.Data.OldestVersion != 3 {
+		t.Fatalf("srcMeta.OldestVersion = %d, want 3 (v1,v2 pruned by max_versions=2)", srcMeta.Data.OldestVersion)
+	}
+
+	if err := m.copySecretFull(context.Background(), key, key, srcMeta, Options{}); err != nil {
+		t.Fatalf("copySecretFull failed: %v", err)
+	}
+
+	// v1 and v2 were pruned: expect placeholder with pruned_at_source subtype
+	for _, prunedV := range []int{1, 2} {
+		payload := dst.rawVersionData(key, prunedV)
+		if payload == nil {
+			t.Fatalf("dst v%d has no stored payload", prunedV)
+		}
+		if got := payload["_reason"]; got != ReasonMissingInMetadata {
+			t.Errorf("dst v%d _reason = %q, want %q", prunedV, got, ReasonMissingInMetadata)
+		}
+		if got := payload["_missing_subtype"]; got != SubtypePrunedAtSource {
+			t.Errorf("dst v%d _missing_subtype = %q, want %q", prunedV, got, SubtypePrunedAtSource)
+		}
+	}
+
+	// v3 and v4 are real versions: check they have no placeholder marker
+	for _, activeV := range []int{3, 4} {
+		payload, err := m.kv2ReadVersion(context.Background(), m.Dst, key, activeV)
+		if err != nil {
+			t.Fatalf("kv2ReadVersion dst v%d failed: %v", activeV, err)
+		}
+		if payload["_vault_migrate"] == "placeholder" {
+			t.Errorf("dst v%d should be real data, got placeholder", activeV)
+		}
+	}
+
+	// VersionStates for pruned versions should be "missing_in_metadata"
+	secretState := m.State.GetSecret(key)
+	if secretState == nil {
+		t.Fatalf("expected state for %s", key)
+	}
+	for _, prunedV := range []int{1, 2} {
+		vs := strconv.Itoa(prunedV)
+		if got := secretState.VersionStates[vs]; got != ReasonMissingInMetadata {
+			t.Errorf("VersionStates[%q] = %q, want %q", vs, got, ReasonMissingInMetadata)
+		}
+	}
+}
+
+// TestCopySecretFull_ReadErrorNoMirroredDelete is the regression lock for
+// DECISION B: a transient read error (non-sentinel, any real HTTP error)
+// must write a _reason:"read_error" placeholder AND leave the destination
+// version readable (not soft-deleted). Only errVersionDataUnavailable
+// (Vault's 404-with-data soft-delete) may trigger the mirror delete.
+func TestCopySecretFull_ReadErrorNoMirroredDelete(t *testing.T) {
+	for _, copyPath := range []string{"copySecretFull", "copyIncrementalVersions"} {
+		t.Run(copyPath, func(t *testing.T) {
+			src := newFakeVault(t)
+			dst := newFakeVault(t)
+			key := "app/readerr"
+
+			src.putVersion(key, map[string]any{"value": "v1"})
+			// Inject a real (non-sentinel) read error -- NOT Vault's 404-with-data.
+			src.setForceDataReadError(key, 500, "injected transient read error")
+
+			m := newTestMigrator(t, src, dst, true)
+
+			srcMeta, err := m.kv2ReadMetadata(context.Background(), m.Src, key)
+			if err != nil {
+				t.Fatalf("kv2ReadMetadata src failed: %v", err)
+			}
+
+			switch copyPath {
+			case "copySecretFull":
+				if err := m.copySecretFull(context.Background(), key, key, srcMeta, Options{}); err != nil {
+					t.Fatalf("copySecretFull failed: %v", err)
+				}
+			case "copyIncrementalVersions":
+				if err := m.copyIncrementalVersions(context.Background(), key, key, srcMeta, 1, 1, Options{}); err != nil {
+					t.Fatalf("copyIncrementalVersions failed: %v", err)
+				}
+			}
+
+			// Payload must be a readable placeholder with _reason:read_error
+			payload := dst.rawVersionData(key, 1)
+			if payload == nil {
+				t.Fatalf("dst v1 has no stored payload; want readable placeholder")
+			}
+			if got := payload["_reason"]; got != ReasonReadError {
+				t.Errorf("dst v1 _reason = %q, want %q", got, ReasonReadError)
+			}
+
+			// Version must NOT be soft-deleted on the destination.
+			dstMeta, err := m.kv2ReadMetadata(context.Background(), m.Dst, key)
+			if err != nil {
+				t.Fatalf("kv2ReadMetadata dst failed: %v", err)
+			}
+			v1meta, ok := dstMeta.Data.Versions["1"]
+			if !ok {
+				t.Fatalf("dst v1 not found in metadata")
+			}
+			if v1meta.DeletionTime != "" {
+				t.Errorf("dst v1 DeletionTime = %q, want empty (read_error must NOT mirror delete)", v1meta.DeletionTime)
+			}
+
+			// VersionStates must record "read_error"
+			secretState := m.State.GetSecret(key)
+			if secretState == nil {
+				t.Fatalf("expected state for %s", key)
+			}
+			if got := secretState.VersionStates["1"]; got != ReasonReadError {
+				t.Errorf("VersionStates[\"1\"] = %q, want %q", got, ReasonReadError)
+			}
+		})
 	}
 }
