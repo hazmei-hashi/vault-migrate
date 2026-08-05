@@ -38,7 +38,7 @@ jobs:
         run: |
           set -euo pipefail
           # ponytail: awk on the `total:` line; no coverage-gate action dependency.
-          # Ratchet floor — measured 76.3%. Raise this one number as coverage rises; never above current.
+          # Ratchet floor — measured 78.0%. Raise this one number as coverage rises; never above current.
           THRESHOLD=73
           total=$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}' | tr -d '%')
           if [ -z "$total" ]; then

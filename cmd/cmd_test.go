@@ -224,6 +224,62 @@ func TestValidateConfig(t *testing.T) {
 			wantErr: true,
 			errMsg:  "clientTimeout must be > 0",
 		},
+		// rollback-specific validation
+		{
+			name: "rollback with empty stateFile and noState false gets specific message",
+			config: config.VaultClientConfig{
+				SrcAddr:       "https://vault-src.example.com:8200",
+				DstAddr:       "https://vault-dst.example.com:8200",
+				LogLevel:      "info",
+				ClientTimeout: 60 * time.Second,
+				StateFile:     "",
+				NoState:       false,
+				Rollback:      true,
+			},
+			wantErr: true,
+			errMsg:  "-rollback requires -stateFile",
+		},
+		{
+			name: "rollback with empty stateFile and noState true gets noState message",
+			config: config.VaultClientConfig{
+				SrcAddr:       "https://vault-src.example.com:8200",
+				DstAddr:       "https://vault-dst.example.com:8200",
+				LogLevel:      "info",
+				ClientTimeout: 60 * time.Second,
+				StateFile:     "",
+				NoState:       true,
+				Rollback:      true,
+			},
+			wantErr: true,
+			errMsg:  "-rollback and -noState are incompatible",
+		},
+		{
+			name: "rollback with valid stateFile is accepted",
+			config: config.VaultClientConfig{
+				SrcAddr:       "https://vault-src.example.com:8200",
+				DstAddr:       "https://vault-dst.example.com:8200",
+				LogLevel:      "info",
+				ClientTimeout: 60 * time.Second,
+				StateFile:     "state.json",
+				NoState:       false,
+				Rollback:      true,
+			},
+			wantErr: false,
+		},
+		{
+			name: "non-rollback empty stateFile still gets generic message",
+			config: config.VaultClientConfig{
+				SrcAddr:       "https://vault-src.example.com:8200",
+				DstAddr:       "https://vault-dst.example.com:8200",
+				LogLevel:      "info",
+				ClientTimeout: 60 * time.Second,
+				StateFile:     "",
+				NoState:       false,
+				Rollback:      false,
+			},
+			wantErr: true,
+			errMsg:  "stateFile cannot be empty when state tracking is enabled",
+		},
 	}
 
 	for _, tt := range tests {
