@@ -115,6 +115,56 @@ func TestRollback_WrongNamespaceRefused(t *testing.T) {
 	}
 }
 
+// TestRollback_AddressNormalizationMatchProceeds: trailing slash / surrounding
+// whitespace on -dstAddr must NOT trigger the wrong-cluster guard when pointing
+// at the SAME cluster recorded in the state file.
+// Locks the trimSlashes normalization at rollback.go Step 2.
+func TestRollback_AddressNormalizationMatchProceeds(t *testing.T) {
+	src := newFakeVault(t)
+	dst := newFakeVault(t)
+
+	dst.putVersion("app/secret", map[string]any{"v": "1"})
+
+	stateFile := buildRollbackState(t, t.TempDir(), src, dst, map[string]*state.Secret{
+		"app/secret": {Status: "completed"},
+	})
+
+	// state records dst.server.URL (e.g. "http://127.0.0.1:PORT").
+	// Variants that should all normalize to the same address:
+	tests := []struct {
+		name    string
+		dstAddr string
+	}{
+		{"trailing slash", dst.server.URL + "/"},
+		{"double trailing slash", dst.server.URL + "//"},
+		{"leading space", " " + dst.server.URL},
+		{"trailing space", dst.server.URL + " "},
+		{"both spaces + slash", " " + dst.server.URL + "/ "},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Use abort path (n) — we only need to get PAST the guard;
+			// no deletes needed to prove the guard passed.
+			useStdinInput(t, "n\n")
+
+			err := Rollback(dst.newClient(t), config.VaultClientConfig{
+				StateFile: stateFile,
+				DstAddr:   tt.dstAddr,
+				LogLevel:  "error",
+			})
+			// nil or "Rollback aborted" → got past the guard.
+			// "rollback refused" → guard incorrectly fired on a same-cluster addr.
+			if err != nil && strings.Contains(err.Error(), "rollback refused") {
+				t.Fatalf("normalization failed for %q: guard fired on same cluster: %v", tt.dstAddr, err)
+			}
+			if dst.deleteCalls() != 0 {
+				t.Fatalf("abort path: expected 0 deletes, got %d", dst.deleteCalls())
+			}
+		})
+	}
+}
+
 // ── Fix 2 guard test ─────────────────────────────────────────────────────────
 
 // TestRollback_ForbiddenNotSkipped: a 403 on delete is a REAL failure —
@@ -620,6 +670,7 @@ func TestRollback_SortedSampleIsDeterministic(t *testing.T) {
 	stateFile := buildRollbackState(t, t.TempDir(), src, dst, secrets)
 
 	// captureStdout swaps os.Stdout for a pipe, runs f(), restores, returns captured bytes.
+	// Defer restores original stdout so a panic inside f() doesn't leak the swap.
 	captureStdout := func(f func()) []byte {
 		t.Helper()
 		origStdout := os.Stdout
@@ -628,9 +679,18 @@ func TestRollback_SortedSampleIsDeterministic(t *testing.T) {
 			t.Fatalf("pipe: %v", err)
 		}
 		os.Stdout = w
+		defer func() {
+			// Idempotent safety: if f() panicked before the explicit restore
+			// below, this ensures os.Stdout is always put back.
+			_ = w.Close()
+			if os.Stdout == w {
+				os.Stdout = origStdout
+			}
+		}()
 
 		f()
 
+		// Explicit close+restore so ReadFrom below doesn't block.
 		w.Close()
 		os.Stdout = origStdout
 

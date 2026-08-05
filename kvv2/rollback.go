@@ -46,7 +46,12 @@ func Rollback(dstClient *api.Client, cfg config.VaultClientConfig) error {
 	// controls only DstAddr and DstNamespace. A mismatch means the operator
 	// is pointing at a DIFFERENT cluster than the one that was migrated to —
 	// which would metadata-delete keys on a cluster this tool never wrote to.
-	if cfg.DstAddr != loaded.Destination.Address || cfg.DstNamespace != loaded.Destination.Namespace {
+	//
+	// Normalize both sides before comparing: trimSlashes strips whitespace
+	// and trailing/leading slashes so "-dstAddr https://vault:8200/" and
+	// "https://vault:8200" match correctly on the same cluster.
+	if trimSlashes(cfg.DstAddr) != trimSlashes(loaded.Destination.Address) ||
+		trimSlashes(cfg.DstNamespace) != trimSlashes(loaded.Destination.Namespace) {
 		return fmt.Errorf(
 			"rollback refused: destination address/namespace in config does not match state file\n"+
 				"  State records:  %s (namespace %q)\n"+
