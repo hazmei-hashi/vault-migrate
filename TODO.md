@@ -40,10 +40,17 @@ All three landed in `.github/workflows/ci.yml` (new PR/push CI). Previously only
 - [x] Read state file and delete destination secrets listed in state
 - [x] Add dry-run/confirmation behavior for rollback flow
 
-### P3: Concurrency
-- Add worker-pool based copy mode (configurable worker count)
-- Preserve per-secret version order while parallelizing across secrets
-- Add retry/rate-limit handling under concurrency
+### P3: Concurrency — REJECTED (won't implement)
+Worker-pool parallel copy considered and rejected. Vault KV v2 migration is
+I/O-bound on Vault (server-side request handling + rate limits), not on this
+CLI's single-threaded loop. Parallelizing across secrets hits the same
+server-side ceiling with added complexity (state-map mutex, escaped-pointer
+races in `copyIncrementalVersions`' shared `VersionHashes` map,
+per-secret `Save` serialization, progress-counter races). Worker count would
+only ever be a coarse throttle the existing transport-layer
+`retryablehttp` backoff (B14) already handles per-request. Default-1 serial
+behavior is correct as-is. If a real workload ever proves CLI-bound (not
+Vault-bound), revisit — but measure first.
 
 ### P4: Placeholder Differentiation
 - Distinguish placeholder reasons clearly:
