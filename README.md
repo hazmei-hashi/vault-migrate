@@ -264,7 +264,12 @@ If a flag is omitted, the tool prompts for the missing value at runtime, in the 
 State file stores:
 - Per-secret status (`completed`, `recreated`, `failed`, `skipped`)
 - Version hashes (SHA256)
-- Version state (`active`, `deleted`, `destroyed`, `missing`, `read_error`) — `deleted` is set when the source version is confirmed genuinely soft-deleted by an actual failed read (Vault's 404-with-data response for that version), never merely because a `deletion_time` field is present: a future-dated `deletion_time` from `delete_version_after` is non-empty while the version is still fully readable, and that case reads real data and is labeled `active`.
+- Version state — one of 5 canonical values:
+  - `active` — version read successfully with real data
+  - `source_version_unavailable` — version read returned Vault's 404-with-data soft-delete sentinel (`errVersionDataUnavailable`); a mirror soft-delete is applied to the destination
+  - `destroyed` — version metadata shows `destroyed=true` (read skipped); a mirror destroy is applied to the destination
+  - `missing_in_metadata` — version number absent from source metadata map (pruned by source `max_versions`, or never existed)
+  - `read_error` — version read failed with a real error (5xx, timeout, permission denied); placeholder written, NO mirror delete applied, logged at WARN
 - Metadata checksum
 - Source and destination version counts — the destination count is **measured** from an actual destination metadata read after copy, not assumed equal to the source count, so it stays accurate even when destination `max_versions` retention prunes below what was written. If that measurement read itself fails, the count falls back to the assumed (source) value and the failure is logged at debug — this bookkeeping never aborts the migration.
 - Summary counters
@@ -306,9 +311,10 @@ After any full or incremental copy (cases 1, 2, and 3), if the destination's mea
 
 - KV v2 mode only (`-mode kvv2`).
 - Source version timestamps are not preserved on destination.
-- Destroyed source payloads are unrecoverable; tool writes placeholder then marks destination version destroyed.
-- Soft-deleted source payloads are also unrecoverable at read time (Vault returns no data for them); the tool writes the configured placeholder then marks the destination version deleted to match, instead of writing an empty/null payload.
-- A transient read failure (5xx, timeout, permission error) on a source version also writes the placeholder to the destination, but does NOT mirror a soft-delete — the destination version stays readable. State labels the version `read_error`. Only a genuine Vault soft-delete sentinel (`errVersionDataUnavailable`, i.e. Vault's 404-with-data shape for a deleted/destroyed version) causes the destination delete to be mirrored.
+- Destroyed source payloads are unrecoverable; tool writes placeholder (`_reason:"destroyed"`) then marks destination version destroyed.
+- Soft-deleted source payloads are also unrecoverable at read time (Vault returns no data for them); the tool writes the placeholder (`_reason:"source_version_unavailable"`) then marks the destination version deleted to match, instead of writing an empty/null payload.
+- A transient read failure (5xx, timeout, permission error) on a source version also writes the placeholder (`_reason:"read_error"`) to the destination, but does NOT mirror a soft-delete — the destination version stays readable. State labels the version `read_error` and the failure is logged at WARN. Only a genuine Vault soft-delete sentinel (`errVersionDataUnavailable`, i.e. Vault's 404-with-data shape for a deleted/destroyed version) causes the destination delete to be mirrored. Note: `copyOneSecret` (the stateless `-noState` path) has no self-heal for a transient read_error baked into the destination on a previous run — re-running in stateful mode or deleting and re-migrating the affected secret is needed.
+- Versions absent from source metadata (pruned by source `max_versions`, i.e. `v < oldest_version`) get placeholder `_reason:"missing_in_metadata"` with `_missing_subtype:"pruned_at_source"`. Versions with no explanation (never existed in recorded history) get `_missing_subtype:"never_existed"`.
 - Token renewal is not handled; token TTL must exceed migration duration.
 - State file is single-writer; do not share one `-stateFile` across parallel migrations.
 - State file writes are atomic against a killed process (temp file in the same directory + `os.Rename`), but NOT against power loss — there is no `fsync` before the rename, so a hard crash at the wrong instant can still leave a lost (not corrupted) write on some filesystems.
@@ -316,7 +322,41 @@ After any full or incremental copy (cases 1, 2, and 3), if the destination's mea
 - A source mount/base path that resolves to zero secrets (missing mount, KV v1 mount, typo'd mount or base path) makes the migration fail rather than report success; the SDK cannot distinguish those cases from a genuinely empty mount.
 - Migrating into a `cas_required` destination is supported via a reactive check-and-set retry: `kv2WriteData` sends the same request as always (no `options.cas`) on the first attempt. If — and only if — that write is rejected with `400 check-and-set parameter required for this call` (destination mount tunable OR destination secret's own `cas_required`), it reads the destination's current version via `<mount>/metadata/*` and retries exactly once with `options.cas` set to that version. On every other destination (the overwhelming majority of real runs) this is byte-identical to the pre-existing wire format — no extra request, no `options` key on the write at all. The one-time extra round trip only happens on a `cas_required` destination, and only after the first write already failed. A genuine concurrent-writer CAS mismatch on the retry is not looped — it propagates as a loud failure, same as any other write error. Requires no new token permission: destination `read` on `<mount>/metadata/*` was already required (see Token Policy Requirements above). Verified against a real Vault cluster (`test/e2e/e2e_test.go`'s `TestE2E_CASRequiredMountDestination`, `TestE2E_CASRequiredPerSecretDestination`, `TestE2E_SourceCASRequiredIncremental`), in addition to mock coverage.
 
-## Rollback
+## Placeholder Payload Format
+
+When a source version cannot be copied with real data, the tool writes a placeholder to the destination instead. All placeholders carry:
+
+```json
+{
+  "_vault_migrate": "placeholder",
+  "_source_version": <int>,
+  "_reason": "<reason>"
+}
+```
+
+Optional field (only when `_reason` is `missing_in_metadata`):
+
+```json
+  "_missing_subtype": "pruned_at_source" | "never_existed"
+```
+
+### `_reason` values
+
+| `_reason` | Cause | Mirror op on dst | VersionStates label |
+|---|---|---|---|
+| `source_version_unavailable` | Read returned Vault's 404-with-data soft-delete sentinel | soft-delete | `source_version_unavailable` |
+| `destroyed` | Metadata shows `destroyed=true`; read skipped | destroy | `destroyed` |
+| `missing_in_metadata` | Version number absent from source metadata map | none | `missing_in_metadata` |
+| `read_error` | Real read failure (5xx, timeout, perms) | none | `read_error` |
+
+### `_missing_subtype` values (only with `missing_in_metadata`)
+
+| `_missing_subtype` | Meaning |
+|---|---|
+| `pruned_at_source` | Version number < source `oldest_version`; pruned by source `max_versions` |
+| `never_existed` | No other explanation; may have been manually removed or never written |
+
+
 
 `-rollback` deletes destination secrets that were successfully migrated,
 as recorded in the state file.
