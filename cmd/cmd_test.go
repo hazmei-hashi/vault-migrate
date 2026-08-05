@@ -310,3 +310,41 @@ func containsSubstring(s, substr string) bool {
 	}
 	return false
 }
+
+func TestRunMode(t *testing.T) {
+	tests := []struct {
+		name    string
+		mode    string
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name:    "empty mode is unsupported",
+			mode:    "",
+			wantErr: true,
+			errMsg:  "unsupported mode",
+		},
+		{
+			name:    "unknown mode is unsupported",
+			mode:    "unknown",
+			wantErr: true,
+			errMsg:  "unsupported mode",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := config.VaultClientConfig{Mode: tt.mode}
+			err := runMode(c, nil, nil)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("runMode() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if tt.wantErr && tt.errMsg != "" {
+				if err == nil || !contains(err.Error(), tt.errMsg) {
+					t.Errorf("runMode() error = %v, want error containing %q", err, tt.errMsg)
+				}
+			}
+		})
+	}
+}
