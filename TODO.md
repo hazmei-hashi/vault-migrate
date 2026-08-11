@@ -53,7 +53,7 @@ Do NOT retry this. Rationale:
 - **`cas_required` ordering:** Moving the metadata write before the loop
   would set `cas_required=true` on the destination up front whenever the
   SOURCE secret has it set, then EVERY subsequent version write in that same
-  loop 400s ("check-and-set parameter required"). Even with B19's reactive
+  loop returns HTTP 400 ("check-and-set parameter required"). Even with B19's reactive
   CAS retry, this remains undesirable.
 - **`delete_version_after` corruption:** The payload carries
   `delete_version_after`, computed as the minimum non-zero of mount and
