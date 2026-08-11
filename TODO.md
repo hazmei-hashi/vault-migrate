@@ -88,16 +88,3 @@ empty, so those two prompt branches are unreachable via the `cmd` entrypoint.
 Kept in code as a library-safe fallback for callers that invoke
 `client.BuildClients` directly without going through `validateConfig` first.
 
-## Completed (summary)
-
-- P1 CI: GitHub Actions workflow, 73% coverage gate (CI floor; current measured 79.8%), artifact publishing, Go 1.25.x + 1.26.x matrix
-- P2 Rollback: `-rollback` mode, state-file-driven delete, dry-run/confirmation
-- P4 Placeholder differentiation: 4 canonical `_reason` values, `_missing_subtype`, `classifyPlaceholderReason`/`placeholderPayload` helpers, all copy paths compute per-version reasons
-- P5 Coverage follow-up: `runMode` extracted from `cmd.Init`, `TestRunMode` added
-- B6 (i) `DestVersionCount` measured from actual destination metadata read after copy (not assumed equal to source)
-- B6 (ii) `warnDestTruncated` emits Warn when destination `max_versions` truncated history
-- B18 fixed: `kv2ReadVersion` returns `errVersionDataUnavailable` for 404-with-data soft-deleted versions; future-dated `delete_version_after` no longer misidentified as deleted
-- B19 fixed: `kv2WriteData` reactively retries once with `options.cas = CurrentVersion` on "check-and-set parameter required"; byte-identical to pre-fix on non-CAS destinations
-- Destructive recopy loop fixed: `verifyDestinationMatches` skips source versions absent from destination metadata instead of treating them as mismatch
-- Prompt desync fixed: shared `config.Prompt`/`PromptRequired` replaces `fmt.Scan`/`bufio.Scanner` mix
-- B1 token logging fixed; B5 namespace-before-lookup fixed; B7 destination metadata 403/5xx misread fixed; B8 client timeout hardcoded fixed (`-clientTimeout`, default 60s); B11 non-atomic state write fixed; B13 `log.Fatal*` in `client/` replaced with returned errors; B14 `-maxRetries` wired into retryablehttp; B16 `trimSlashes` fixed; B17 `isMetadataNotFound` purely structural (no substring matching)
