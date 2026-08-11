@@ -7,7 +7,7 @@ Active backlog only. Obsolete historical notes removed.
 - 293 tests passing across 7 packages (E2E gated behind `E2E_TESTS=1`, 6
   scenarios verified against a real Vault 1.18.5 cluster this session,
   not counted in the 293)
-- Coverage: `client` 52.6%, `cmd` 37.9%, `config` 100.0%, `kvv2` 82.9%, `state` 85.5%; **total 78.0%**
+- Coverage: `client` 52.6%, `cmd` ~47.6%, `config` 100.0%, `kvv2` 82.9%, `state` 85.5%; **total 79.8%**
 - Phases 1-4 complete (unit, integration, mock harness, E2E)
 - Prompt desync bug fixed: shared `config.Prompt`/`PromptRequired` replaces
   `fmt.Scan`/`bufio.Scanner` mix in `client.go` and `kvv2/init.go`
@@ -78,9 +78,10 @@ Vault-bound), revisit — but measure first.
   self-heal for a transient `read_error` baked into the destination on a previous
   run. Re-run in stateful mode or delete and re-migrate the affected secret.
 
-### P5: Coverage Follow-up (Optional)
-- Improve bootstrap coverage (`main`, `cmd` CLI wiring)
-- Add targeted failure-path tests where defects appear
+### [x] P5: Coverage Follow-up (DONE)
+- [x] Extract `runMode` from `Init` in `cmd/cmd.go` — pure function, testable without live Vault
+- [x] Add `TestRunMode` in `cmd/cmd_test.go` — table-driven, covers unsupported-mode default branch with nil clients
+- Remainder (`Init` glue, `main.go`) intentionally left to E2E — bootstrap glue coverage at meaningful ceiling
 
 ### P6: Deferred Bugs
 

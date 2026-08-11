@@ -9,6 +9,8 @@ import (
 	"vault-migrate/client"
 	"vault-migrate/config"
 	"vault-migrate/kvv2"
+
+	"github.com/hashicorp/vault/api"
 )
 
 func Init() {
@@ -50,19 +52,20 @@ func Init() {
 		log.Fatalf("Error building clients: %v", err)
 	}
 
+	if err = runMode(c, srcClient, dstClient); err != nil {
+		log.Fatalf("%v", err)
+	}
+}
+
+func runMode(c config.VaultClientConfig, src, dst *api.Client) error {
 	switch c.Mode {
 	case "kvv2":
 		if c.Rollback {
-			err = kvv2.Rollback(dstClient, c)
-		} else {
-			err = kvv2.Init(srcClient, dstClient, c)
+			return kvv2.Rollback(dst, c)
 		}
+		return kvv2.Init(src, dst, c)
 	default:
-		log.Fatal("Supported modes: kvv2")
-	}
-
-	if err != nil {
-		log.Fatalf("%v", err)
+		return fmt.Errorf("unsupported mode: %q (supported: kvv2)", c.Mode)
 	}
 }
 
