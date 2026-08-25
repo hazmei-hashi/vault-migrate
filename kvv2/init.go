@@ -2,6 +2,7 @@ package kvv2
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -247,23 +248,36 @@ func (m *Migrator) Run(ctx context.Context, opts Options) error {
 			copyErr = m.copyOneSecret(ctx, srcKey, dstKey, opts)
 		}
 
-		if copyErr != nil {
+		switch {
+		case errors.Is(copyErr, errSourceSecretGone):
+			// B20: the key came back from the initial walk but its source
+			// metadata read was ABSENT by the time the copy loop reached it
+			// -- deleted at the source in between. Nothing to copy and
+			// nothing failed, so this is a skip regardless of
+			// -continueOnError; aborting the whole migration over a secret
+			// that no longer exists is what this replaces. Structural check
+			// only (see errSourceSecretGone) -- 403/400/5xx/timeout still
+			// take the failure branch below.
+			skipped++
+			m.Logger.Warn("SKIP (source secret no longer exists)", "progress", fmt.Sprintf("%d/%d", i+1, len(keys)), "src", srcKey, "err", copyErr)
+
+		case copyErr != nil:
 			failed++
 			if opts.ContinueOnError {
 				m.Logger.Warn("Copy failed", "progress", fmt.Sprintf("%d/%d", i+1, len(keys)), "src", srcKey, "dst", dstKey, "err", copyErr)
 				continue
 			}
 			return fmt.Errorf("copy %q -> %q: %w", srcKey, dstKey, copyErr)
-		}
 
-		if m.State != nil {
+		case m.State != nil:
 			secret := m.State.GetSecret(srcKey)
 			if secret != nil && secret.Status == "skipped" {
 				skipped++
 			} else {
 				completed++
 			}
-		} else {
+
+		default:
 			completed++
 		}
 

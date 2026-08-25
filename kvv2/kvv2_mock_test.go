@@ -3406,3 +3406,235 @@ func TestCopySecretFull_ReadErrorNoMirroredDelete(t *testing.T) {
 		})
 	}
 }
+
+// --- B20: source secret gone between the walk and the copy loop ------------
+
+// deleteSecretLocked removes a secret from the fake WITHOUT taking f.mu.
+// Only for use from an afterMetadataGET hook, which already runs under the
+// lock held by handleMetadata.
+func (f *fakeVault) deleteSecretLocked(key string) {
+	delete(f.secrets, key)
+}
+
+// TestRun_SourceSecretDeletedBetweenWalkAndCopy_SkipsInsteadOfAborting is
+// B20's core regression lock. walkAllKeys enumerates every key ONCE up front;
+// the copy loop then works that list for the whole (potentially hours-long)
+// migration. A secret deleted at the source inside that window (`vault kv
+// metadata delete`, a rotation/cleanup job) makes its metadata read come back
+// as Vault's bare-404 -> nil/nil "empty metadata" shape.
+//
+// Before the fix both copy paths returned that as a plain error, so the
+// DEFAULT run (-continueOnError OFF) aborted the entire migration over a
+// secret that no longer exists and therefore has nothing to copy. It must be
+// skipped instead: run succeeds, every other secret still migrates.
+func TestRun_SourceSecretDeletedBetweenWalkAndCopy_SkipsInsteadOfAborting(t *testing.T) {
+	tests := []struct {
+		name      string
+		withState bool
+	}{
+		{name: "stateful", withState: true},
+		{name: "stateless (-noState)", withState: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			src := newFakeVault(t)
+			dst := newFakeVault(t)
+
+			// Sorted copy order: app/alpha first, app/zulu second.
+			src.putVersion("app/alpha", map[string]any{"value": "a"})
+			src.putVersion("app/zulu", map[string]any{"value": "z"})
+
+			// Race: app/zulu is deleted at the source right after app/alpha's
+			// metadata read -- i.e. after the walk listed it, before the copy
+			// loop reaches it.
+			src.setAfterMetadataGET("app/alpha", func() {
+				src.deleteSecretLocked("app/zulu")
+			})
+
+			m := newTestMigrator(t, src, dst, tt.withState)
+
+			// ContinueOnError deliberately OFF: the whole point is that the
+			// default run no longer aborts.
+			if err := m.Run(context.Background(), Options{}); err != nil {
+				t.Fatalf("Run failed on a source secret that vanished mid-run: %v", err)
+			}
+
+			// The surviving secret must still be migrated.
+			if _, err := m.kv2ReadMetadata(context.Background(), m.Dst, "app/alpha"); err != nil {
+				t.Errorf("app/alpha missing at destination: %v", err)
+			}
+
+			// The vanished secret must NOT be conjured at the destination.
+			_, err := m.kv2ReadMetadata(context.Background(), m.Dst, "app/zulu")
+			if !isMetadataNotFound(err) {
+				t.Errorf("app/zulu metadata at destination = %v, want not-found", err)
+			}
+
+			if !tt.withState {
+				return
+			}
+
+			gone := m.State.GetSecret("app/zulu")
+			if gone == nil {
+				t.Fatalf("expected a state entry for the vanished secret")
+			}
+			if gone.Status != "skipped" {
+				t.Errorf("state[app/zulu].Status = %q, want %q", gone.Status, "skipped")
+			}
+			if m.State.Summary.Failed != 0 {
+				t.Errorf("Summary.Failed = %d, want 0 (a secret that no longer exists is not a failure)", m.State.Summary.Failed)
+			}
+			if m.State.Summary.Skipped != 1 {
+				t.Errorf("Summary.Skipped = %d, want 1", m.State.Summary.Skipped)
+			}
+			if m.State.Summary.Completed != 1 {
+				t.Errorf("Summary.Completed = %d, want 1 (app/alpha)", m.State.Summary.Completed)
+			}
+		})
+	}
+}
+
+// TestCopyOneSecretWithState_SourceGone_KeepsCompletedStateForRollback locks
+// the one case recordSourceGone must NOT rewrite: an earlier run already
+// copied the secret ("completed"/"recreated"), so a real destination copy
+// exists. rollback.go targets exactly those two statuses -- downgrading the
+// entry to "skipped" because the SOURCE later vanished would strip that copy
+// out of the rollback target set and strand it on the destination.
+func TestCopyOneSecretWithState_SourceGone_KeepsCompletedStateForRollback(t *testing.T) {
+	for _, status := range []string{"completed", "recreated"} {
+		t.Run(status, func(t *testing.T) {
+			src := newFakeVault(t)
+			dst := newFakeVault(t)
+			key := "app/migrated-then-deleted"
+
+			src.putVersion(key, map[string]any{"value": "v1"})
+
+			m := newTestMigrator(t, src, dst, true)
+			m.State.UpdateSecret(key, &state.Secret{
+				Status:             status,
+				SourceVersionCount: 1,
+				DestVersionCount:   1,
+				VersionHashes:      map[string]string{"1": "sha256:deadbeef"},
+			})
+
+			// Source secret disappears before this run reaches it.
+			src.setForceMetadataReadError(key, http.StatusNotFound)
+
+			err := m.copyOneSecretWithState(context.Background(), key, key, Options{})
+			if !errors.Is(err, errSourceSecretGone) {
+				t.Fatalf("copyOneSecretWithState err = %v, want errSourceSecretGone", err)
+			}
+
+			got := m.State.GetSecret(key)
+			if got == nil {
+				t.Fatalf("state entry disappeared")
+			}
+			if got.Status != status {
+				t.Errorf("state Status = %q, want %q preserved for rollback", got.Status, status)
+			}
+			if got.DestVersionCount != 1 {
+				t.Errorf("DestVersionCount = %d, want 1 preserved", got.DestVersionCount)
+			}
+		})
+	}
+}
+
+// TestRun_SourceMetadataRealError_StillFailsLoudly is the B17 counterpart of
+// the B20 skip: the "source secret gone" branch keys off isMetadataNotFound,
+// which is STRUCTURAL (our sentinel or an *api.ResponseError 404). Every other
+// metadata-read failure -- 403 permission denied, 400 "unsupported path" on a
+// KV v1 mount, 5xx, timeouts -- must still fail the run exactly as before.
+// Widening the skip to those would silently drop real secrets while still
+// exiting 0, which is the failure mode B17 exists to prevent.
+func TestRun_SourceMetadataRealError_StillFailsLoudly(t *testing.T) {
+	tests := []struct {
+		name      string
+		status    int
+		withState bool
+	}{
+		{name: "500 stateful", status: http.StatusInternalServerError, withState: true},
+		{name: "500 stateless", status: http.StatusInternalServerError, withState: false},
+		{name: "403 stateful", status: http.StatusForbidden, withState: true},
+		{name: "403 stateless", status: http.StatusForbidden, withState: false},
+		{name: "400 unsupported path stateful", status: http.StatusBadRequest, withState: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			src := newFakeVault(t)
+			dst := newFakeVault(t)
+
+			src.putVersion("app/broken", map[string]any{"value": "v1"})
+			src.setForceMetadataReadError("app/broken", tt.status)
+
+			m := newTestMigrator(t, src, dst, tt.withState)
+
+			err := m.Run(context.Background(), Options{})
+			if err == nil {
+				t.Fatalf("Run returned nil for a %d source metadata read; want a loud failure", tt.status)
+			}
+			if errors.Is(err, errSourceSecretGone) {
+				t.Errorf("a %d was misclassified as errSourceSecretGone: %v", tt.status, err)
+			}
+		})
+	}
+}
+
+// TestRun_MetadataOnlySecret_CopiesMetadataSettings covers the OTHER "empty
+// metadata" shape: a secret whose metadata exists but whose versions map is
+// empty (`vault kv metadata put` with no data ever written). There is no
+// version to copy, but the metadata settings must still land on the
+// destination and the run must report success, not a failure.
+func TestRun_MetadataOnlySecret_CopiesMetadataSettings(t *testing.T) {
+	tests := []struct {
+		name      string
+		withState bool
+	}{
+		{name: "stateful", withState: true},
+		{name: "stateless (-noState)", withState: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			src := newFakeVault(t)
+			dst := newFakeVault(t)
+			key := "app/metadata-only"
+
+			src.setMetadata(key, false, 5, "", map[string]string{"owner": "platform"})
+
+			m := newTestMigrator(t, src, dst, tt.withState)
+			if err := m.Run(context.Background(), Options{}); err != nil {
+				t.Fatalf("Run failed on a metadata-only secret: %v", err)
+			}
+
+			dstMeta, err := m.kv2ReadMetadata(context.Background(), m.Dst, key)
+			if err != nil {
+				t.Fatalf("destination metadata missing: %v", err)
+			}
+			if dstMeta.Data.MaxVersions != 5 {
+				t.Errorf("dst MaxVersions = %d, want 5", dstMeta.Data.MaxVersions)
+			}
+			if got := dstMeta.Data.CustomMetadata["owner"]; got != "platform" {
+				t.Errorf("dst custom_metadata[owner] = %q, want %q", got, "platform")
+			}
+			if len(dstMeta.Data.Versions) != 0 {
+				t.Errorf("dst versions = %d, want 0 (source had none)", len(dstMeta.Data.Versions))
+			}
+
+			if !tt.withState {
+				return
+			}
+			secretState := m.State.GetSecret(key)
+			if secretState == nil {
+				t.Fatalf("expected state entry for %s", key)
+			}
+			if secretState.Status != "completed" {
+				t.Errorf("state Status = %q, want %q", secretState.Status, "completed")
+			}
+			if secretState.SourceVersionCount != 0 {
+				t.Errorf("SourceVersionCount = %d, want 0", secretState.SourceVersionCount)
+			}
+		})
+	}
+}

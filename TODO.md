@@ -2,12 +2,12 @@
 
 Active backlog only. Obsolete historical notes removed.
 
-## Current Baseline (2026-08-11)
+## Current Baseline (2026-08-25)
 
-- 319 tests passing across 7 packages (E2E gated behind `E2E_TESTS=1`, 6
+- 334 tests passing across 7 packages (E2E gated behind `E2E_TESTS=1`, 6
   scenarios verified against a real Vault 1.18.5 cluster, not counted in the
-  319)
-- Coverage: `client` 52.6%, `cmd` 41.4%, `config` 100.0%, `kvv2` 84.7%, `state` 85.5%; **total 79.8%**
+  334)
+- Coverage: `client` 52.6%, `cmd` 41.4%, `config` 100.0%, `kvv2` 85.6%, `state` 85.5%; **total 80.6%**
 - Phases 1-4 complete (unit, integration, mock harness, E2E)
 - Harness realism lesson: `kvv2/kvv2_mock_test.go` used to be more forgiving
   than real Vault (bare errors instead of 404-with-data for soft-deleted/
@@ -43,6 +43,18 @@ Vault-bound), revisit — but measure first.
 transient `read_error` placeholder baked into the destination on a previous
 run. Re-run in stateful mode or delete and re-migrate the affected secret.
 Out of scope — not a regression, flagged so it isn't filed as a new bug.
+
+### P7: Known gap — `custom_metadata` cleared at source is not cleared at destination
+
+`kv2WriteMetadataSettings` only sends `custom_metadata` when the source map is
+non-empty (`len(meta.Data.CustomMetadata) > 0`), so a source secret whose
+`custom_metadata` was REMOVED after an earlier migration leaves the stale
+entries in place on the destination. Found while diagnosing B20; deliberately
+NOT changed there — sending `custom_metadata: {}` unconditionally would clear
+destination-side metadata the operator may have set themselves, which is the
+same "silently rewriting operator config" objection that killed B6-iii. If
+faithful mirroring is wanted, gate it behind an explicit flag. Documented as a
+limitation in README.
 
 ### P6: Deferred Decisions (do not re-litigate)
 

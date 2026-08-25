@@ -294,6 +294,12 @@ Per-secret behavior:
 - Migration returns error for that secret.
 - With `-continueOnError`, migration continues to next secret.
 
+5. Source secret no longer exists
+- The key was returned by the initial walk, but by the time the copy loop reached it the source metadata read came back absent — Vault's bare-404 / `nil, nil` "empty metadata" shape. This is the normal outcome of a `vault kv metadata delete` (or a cleanup/rotation job) landing between the one-time walk and the per-secret copy, which on a long migration can be hours apart.
+- There is nothing to copy, so the secret is skipped, logged at WARN, and the migration continues — the run still exits 0 **regardless of `-continueOnError`**. Nothing is written to the destination for it.
+- State records it `skipped`, with one exception: an entry an earlier run already recorded `completed` or `recreated` is preserved untouched, because a real destination copy exists and `-rollback` targets exactly those two statuses.
+- Only a **structural** not-found (the `errMetadataNotFound` sentinel or an `*api.ResponseError` 404) takes this path. A 403, a 400 `unsupported path` on a KV v1 mount, a 5xx, or a timeout on the same read still fails the secret loudly, exactly as before.
+
 After any full or incremental copy (cases 1, 2, and 3), if the destination's measured version count ends up lower than the source count just copied, a `Logger.Warn` names the secret key and both the source and measured destination version counts. This is a warning only — the migration does not fail and does not retry: the latest value is written last and always survives destination retention, so only older history is affected.
 
 ### Legacy Mode (`-noState=true`)
@@ -320,6 +326,9 @@ After any full or incremental copy (cases 1, 2, and 3), if the destination's mea
 - State file writes are atomic against a killed process (temp file in the same directory + `os.Rename`), but NOT against power loss — there is no `fsync` before the rename, so a hard crash at the wrong instant can still leave a lost (not corrupted) write on some filesystems.
 - Vault client timeout is configurable via `-clientTimeout` (default 60s per request).
 - A source mount/base path that resolves to zero secrets (missing mount, KV v1 mount, typo'd mount or base path) makes the migration fail rather than report success; the SDK cannot distinguish those cases from a genuinely empty mount.
+- A source secret deleted between the initial walk and its turn in the copy loop is skipped, not failed — see case 5 under Per-secret behavior. The walk enumerates every key once, up front, so this window is as long as the migration itself.
+- A source secret with metadata but no data versions (`vault kv metadata put ...` with no value ever written, so `versions` is empty) is migrated as metadata only: `max_versions`, `cas_required`, `delete_version_after`, and `custom_metadata` are copied, no version is written, and state records it `completed` with a source version count of 0.
+- `custom_metadata` is only sent to the destination when the source has at least one entry, so clearing all `custom_metadata` at the source does not clear it on a destination secret migrated by an earlier run.
 - Migrating into a `cas_required` destination is supported via a reactive check-and-set retry: `kv2WriteData` sends the same request as always (no `options.cas`) on the first attempt. If — and only if — that write is rejected with `400 check-and-set parameter required for this call` (destination mount tunable OR destination secret's own `cas_required`), it reads the destination's current version via `<mount>/metadata/*` and retries exactly once with `options.cas` set to that version. On every other destination (the overwhelming majority of real runs) this is byte-identical to the pre-existing wire format — no extra request, no `options` key on the write at all. The one-time extra round trip only happens on a `cas_required` destination, and only after the first write already failed. A genuine concurrent-writer CAS mismatch on the retry is not looped — it propagates as a loud failure, same as any other write error. Requires no new token permission: destination `read` on `<mount>/metadata/*` was already required (see Token Policy Requirements above). Verified against a real Vault cluster (`test/e2e/e2e_test.go`'s `TestE2E_CASRequiredMountDestination`, `TestE2E_CASRequiredPerSecretDestination`, `TestE2E_SourceCASRequiredIncremental`), in addition to mock coverage.
 
 ## Placeholder Payload Format
