@@ -31,6 +31,28 @@ var errMetadataNotFound = errors.New("metadata not found")
 // actually failed to produce a payload.
 var errVersionDataUnavailable = errors.New("source version data unavailable (soft-deleted or destroyed)")
 
+// errSourceSecretGone sentinels a source key that the initial walk LISTed but
+// whose metadata read then came back ABSENT (Vault's nil/nil "empty metadata"
+// shape, see kv2ReadMetadata, or a genuine 404).
+//
+// B20: walkAllKeys enumerates every key ONCE, up front; the copy loop then
+// works that list for as long as the migration takes. Anything that removes a
+// source secret in that window -- an operator running `vault kv metadata
+// delete`, an automated rotation/cleanup job, a `delete_version_after` sweep
+// that took the whole secret with it -- lands here as an empty metadata read.
+// Both copy paths used to return that as a plain error, so the DEFAULT run
+// (-continueOnError off) aborted the entire migration over a secret that no
+// longer exists and therefore has nothing to copy, and the stateful path
+// additionally recorded it "failed" with a climbing retry_count that no re-run
+// could ever clear.
+//
+// The check is STRUCTURAL (isMetadataNotFound: our own sentinel or an
+// *api.ResponseError 404), never substring, so a 403, a 400 "unsupported path"
+// on a KV v1 mount, a 5xx, or a timeout still fails loudly exactly as before --
+// B17's rule holds. Run counts a gone secret as skipped, not completed, so the
+// summary never claims to have copied it.
+var errSourceSecretGone = errors.New("source secret no longer exists")
+
 // walkAllKeys returns leaf secret keys relative to the mount
 func (m *Migrator) walkAllKeys(ctx context.Context, c KVV2Cluster, startPrefix string) ([]string, error) {
 	m.Logger.Info("STARTING COPY", "base-path", startPrefix)
@@ -152,6 +174,12 @@ type kv2ReadVersionResp struct {
 func (m *Migrator) copyOneSecret(ctx context.Context, srcKey, dstKey string, opts Options) error {
 	meta, err := m.kv2ReadMetadata(ctx, m.Src, srcKey)
 	if err != nil {
+		if isMetadataNotFound(err) {
+			// B20: deleted at the source between the walk and now --
+			// nothing to copy. Surface the sentinel so Run counts it as
+			// skipped instead of aborting the run (see errSourceSecretGone).
+			return fmt.Errorf("%w: %v", errSourceSecretGone, err)
+		}
 		return fmt.Errorf("read metadata: %w", err)
 	}
 
@@ -246,6 +274,11 @@ func (m *Migrator) copyOneSecretWithState(ctx context.Context, srcKey, dstKey st
 
 	srcMeta, err := m.kv2ReadMetadata(ctx, m.Src, srcKey)
 	if err != nil {
+		if isMetadataNotFound(err) {
+			// B20: deleted at the source between the walk and now.
+			m.recordSourceGone(srcKey, existingState)
+			return fmt.Errorf("%w: %v", errSourceSecretGone, err)
+		}
 		secretState := &state.Secret{
 			Status:     "failed",
 			Error:      fmt.Sprintf("read source metadata: %v", err),
@@ -349,6 +382,36 @@ func (m *Migrator) copyOneSecretWithState(ctx context.Context, srcKey, dstKey st
 
 	m.Logger.Debug("FULL COPY", "secret", srcKey, "versions", srcMaxVersion)
 	return m.copySecretFull(ctx, srcKey, dstKey, srcMeta, opts)
+}
+
+// recordSourceGone books a source secret that vanished between the walk and
+// its turn in the copy loop (B20, see errSourceSecretGone).
+//
+// A secret already recorded "completed" or "recreated" keeps that entry
+// untouched: a real destination copy exists from an earlier run, and rollback
+// targets exactly those two statuses (rollback.go). Downgrading the entry to
+// "skipped" here would strip that copy out of the rollback target set and
+// leave it stranded on the destination with no way to undo it. Any other
+// prior status (or none) becomes "skipped": nothing was written, so there is
+// nothing to roll back, and "skipped" keeps it out of the failed bucket and
+// clears the stale retry_count a pre-B20 run left behind.
+func (m *Migrator) recordSourceGone(srcKey string, existingState *state.Secret) {
+	if m.State == nil {
+		return
+	}
+	if existingState != nil && (existingState.Status == "completed" || existingState.Status == "recreated") {
+		m.Logger.Warn("source secret no longer exists; keeping prior migrated state for rollback",
+			"secret", srcKey, "status", existingState.Status)
+		return
+	}
+
+	m.State.UpdateSecret(srcKey, &state.Secret{
+		Status: "skipped",
+		Error:  "source secret no longer exists (metadata absent) - nothing to copy",
+	})
+	if err := m.State.Save(m.StateFile); err != nil {
+		m.Logger.Error("failed to save state", "err", err)
+	}
 }
 
 func (m *Migrator) copySecretFull(ctx context.Context, srcKey, dstKey string, srcMeta *kv2MetadataResp, opts Options) error {
